@@ -1871,8 +1871,7 @@ class PreTrainedTokenizerBase(SpecialTokensMixin, PushToHubMixin):
         This method is intended for use with chat models, and will read the tokenizer's `response_schema` attribute to
         control parsing, although this can be overridden by passing a `response_schema` argument directly.
 
-        For more information, see the
-        [response parsing](https://huggingface.co/docs/transformers/main/en/chat_response_parsing) documentation.
+        This method is highly experimental and schemas are likely to change in upcoming versions. Hold tight!
 
         Args:
             response (`str`):
