@@ -1010,6 +1010,14 @@ class PreTrainedTokenizerBase(PushToHubMixin):
         self._special_tokens_map = dict.fromkeys(self.SPECIAL_TOKENS_ATTRIBUTES)
         self._extra_special_tokens = []  # List of extra model-specific special tokens
 
+        # V5: track both explicit and auto-detected model-specific tokens
+        explicit_model_specific_tokens = kwargs.pop("model_specific_special_tokens", None)
+        if explicit_model_specific_tokens is None:
+            explicit_model_specific_tokens = {}
+        elif not isinstance(explicit_model_specific_tokens, dict):
+            raise TypeError("model_specific_special_tokens must be a dictionary of token name to token value")
+        auto_model_specific_tokens = {}
+
         # Directly set hidden values to allow init with tokens not yet in vocab
         for key in list(kwargs.keys()):
             if key in self.SPECIAL_TOKENS_ATTRIBUTES:
@@ -1036,6 +1044,15 @@ class PreTrainedTokenizerBase(PushToHubMixin):
                             "extra_special_tokens must be a list/tuple of str or AddedToken, or a dict mapping names to tokens"
                         )
                     self._extra_special_tokens = list(value)
+            elif (
+                key.endswith("_token")
+                and key not in self.SPECIAL_TOKENS_ATTRIBUTES
+                and isinstance(kwargs[key], (str, AddedToken))
+            ):
+                value = kwargs.pop(key)
+                if value is None:
+                    continue
+                auto_model_specific_tokens[key] = value
 
         # For backward compatibility we fallback to set model_max_length from max_len if provided
         model_max_length = kwargs.pop("model_max_length", kwargs.pop("max_len", None))
@@ -1055,7 +1072,7 @@ class PreTrainedTokenizerBase(PushToHubMixin):
 
         self.model_input_names = kwargs.pop("model_input_names", self.model_input_names)
 
-        # By default, cleaning tokenization spaces for both fast and slow tokenizers
+        # By default, clean up tokenization spaces for both fast and slow tokenizers
         self.clean_up_tokenization_spaces = kwargs.pop("clean_up_tokenization_spaces", False)
 
         # By default, do not split special tokens for both fast and slow tokenizers
@@ -1069,9 +1086,7 @@ class PreTrainedTokenizerBase(PushToHubMixin):
             # we reconstruct that into a single dict while loading them.
             self.chat_template = {template["name"]: template["template"] for template in self.chat_template}
 
-        # V5: model_specific_special_tokens kwarg adds new NAMED tokens (e.g., image_token for multimodal models)
-        # This is different from extra_special_tokens property which is the list of extra unnamed tokens
-        model_specific_tokens = kwargs.pop("model_specific_special_tokens", {})
+        model_specific_tokens = {**auto_model_specific_tokens, **explicit_model_specific_tokens}
         if model_specific_tokens:
             self._set_model_specific_special_tokens(special_tokens=model_specific_tokens)
 
@@ -1080,6 +1095,10 @@ class PreTrainedTokenizerBase(PushToHubMixin):
         # Backend information (V5: tracking which backend and files were used)
         self.backend = kwargs.pop("backend", None)
         self.files_loaded = kwargs.pop("files_loaded", [])
+
+    def _set_processor_class(self, processor_class: str):
+        """Sets processor class so it can be serialized in `tokenizer_config.json`."""
+        self._processor_class = processor_class
 
     # ---- Special tokens API (moved from SpecialTokensMixin) ----
     def add_special_tokens(
@@ -1767,28 +1786,9 @@ class PreTrainedTokenizerBase(PushToHubMixin):
         trust_remote_code=False,
         **kwargs,
     ):
-        # We instantiate fast tokenizers based on a slow tokenizer if we don't have access to the tokenizer.json
-        # file or if `from_slow` is set to True.
-        from_slow = kwargs.get("from_slow", False)
-        gguf_file = kwargs.get("gguf_file")
+        # We instantiate `RustTokenizer` based on the format of the file and our converters
+        # if there is no `tokenizer.json` file.
         has_tokenizer_file = resolved_vocab_files.get("tokenizer_file", None) is not None
-
-        # If one passes a GGUF file path to `gguf_file` there is no need for this check as the tokenizer will be
-        # loaded directly from the GGUF file.
-        if (from_slow or not has_tokenizer_file) and cls.slow_tokenizer_class is not None and not gguf_file:
-            slow_tokenizer = (cls.slow_tokenizer_class)._from_pretrained(
-                copy.deepcopy(resolved_vocab_files),
-                pretrained_model_name_or_path,
-                copy.deepcopy(init_configuration),
-                *init_inputs,
-                token=token,
-                cache_dir=cache_dir,
-                local_files_only=local_files_only,
-                _commit_hash=_commit_hash,
-                **(copy.deepcopy(kwargs)),
-            )
-        else:
-            slow_tokenizer = None
 
         # Prepare tokenizer initialization kwargs
         # Did we saved some inputs and kwargs to reload ?
@@ -1832,54 +1832,6 @@ class PreTrainedTokenizerBase(PushToHubMixin):
                 # For backward compatibility with odl format.
                 if isinstance(init_kwargs["auto_map"], (tuple, list)):
                     init_kwargs["auto_map"] = {"AutoTokenizer": init_kwargs["auto_map"]}
-
-        if config_tokenizer_class is None:
-            # Matt: This entire block is only used to decide if the tokenizer class matches the class in the repo.
-            #       If not, it raises a warning, but otherwise continues. Since we mostly load tokenizers with
-            #       AutoTokenizer these days, it seems like a lot of work (and a source of bugs) for little gain.
-            #       Maybe we can just remove this entirely?
-            from .models.auto.configuration_auto import AutoConfig  # tests_ignore
-
-            # Second attempt. If we have not yet found tokenizer_class, let's try to use the config.
-            try:
-                config = AutoConfig.from_pretrained(
-                    pretrained_model_name_or_path,
-                    token=token,
-                    cache_dir=cache_dir,
-                    local_files_only=local_files_only,
-                    trust_remote_code=trust_remote_code,
-                    _commit_hash=_commit_hash,
-                )
-                config_tokenizer_class = config.tokenizer_class
-            except (OSError, ValueError, KeyError):
-                # skip if an error occurred.
-                config = None
-            if config_tokenizer_class is None:
-                # Third attempt. If we have not yet found the original type of the tokenizer,
-                # we are loading we see if we can infer it from the type of the configuration file
-                from .models.auto.tokenization_auto import TOKENIZER_MAPPING_NAMES  # tests_ignore
-
-                if hasattr(config, "model_type"):
-                    model_type = config.model_type
-                else:
-                    # Fallback: use pattern matching on the string.
-                    model_type = None
-                    for pattern in TOKENIZER_MAPPING_NAMES:
-                        if pattern in str(pretrained_model_name_or_path):
-                            model_type = pattern
-                            break
-
-                if model_type is not None:
-                    config_tokenizer_class = TOKENIZER_MAPPING_NAMES.get(model_type)
-
-        if config_tokenizer_class is not None:
-            if cls.__name__.replace("Fast", "") != config_tokenizer_class.replace("Fast", ""):
-                logger.warning(
-                    "The tokenizer class you load from this checkpoint is not the same type as the class this"
-                    " function is called from. It may result in unexpected tokenization. \nThe tokenizer class you"
-                    f" load from this checkpoint is '{config_tokenizer_class}'. \nThe class this function is called"
-                    f" from is '{cls.__name__}'."
-                )
 
         # Preserve extra_special_tokens from tokenizer_config.json before updating with kwargs
         # extra_special_tokens should be a list (user-defined extra tokens)
@@ -1936,8 +1888,6 @@ class PreTrainedTokenizerBase(PushToHubMixin):
                 init_kwargs[args_name] = file_path
         tokenizer_file = resolved_vocab_files.get("tokenizer_file", None)
 
-        if slow_tokenizer is not None:
-            init_kwargs["__slow_tokenizer"] = slow_tokenizer
         init_kwargs["name_or_path"] = pretrained_model_name_or_path
 
         #### Handle tokenizer serialization of added and special tokens
@@ -2401,6 +2351,8 @@ class PreTrainedTokenizerBase(PushToHubMixin):
             tokenizer_config.pop("tokenizer_file", None)
         if "device_map" in tokenizer_config:
             tokenizer_config.pop("device_map")
+        if "slow_tokenizer_class" in tokenizer_config:
+            tokenizer_config.pop("slow_tokenizer_class")
 
         with open(tokenizer_config_file, "w", encoding="utf-8") as f:
             out_str = json.dumps(tokenizer_config, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
@@ -3141,7 +3093,7 @@ class PreTrainedTokenizerBase(PushToHubMixin):
         token_ids = to_py_obj(token_ids)
 
         # If we received batched input, decode each sequence
-        if isinstance(token_ids, (list, tuple)) and (len(token_ids) == 0 or isinstance(token_ids[0], (list, tuple))):
+        if isinstance(token_ids, (list, tuple)) and len(token_ids) > 0 and isinstance(token_ids[0], (list, tuple)):
             clean_up_tokenization_spaces = kwargs.pop("clean_up_tokenization_spaces", False)
             return [
                 self._decode(

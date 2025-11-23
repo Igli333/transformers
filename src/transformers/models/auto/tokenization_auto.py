@@ -23,6 +23,8 @@ from typing import Any, Optional, Union
 
 from transformers.utils.import_utils import is_mistral_common_available
 
+
+from ...tokenization_python import PreTrainedTokenizer
 from ... import PythonBackend
 from ...configuration_utils import PreTrainedConfig
 from ...dynamic_module_utils import get_class_from_dynamic_module, resolve_trust_remote_code
@@ -233,7 +235,7 @@ TOKENIZER_MAPPING_NAMES = OrderedDict[str, Optional[str]](
         ("mpnet", "MPNetTokenizer" if is_tokenizers_available() else None),
         ("mpt", "GPTNeoXTokenizerFast" if is_tokenizers_available() else None),
         ("mra", "RobertaTokenizer"),
-        ("mt5", "MT5TokenizerFast" if is_tokenizers_available() else None),
+        ("mt5", "T5Tokenizer" if is_tokenizers_available() else None),
         ("musicgen", "T5Tokenizer" if is_tokenizers_available() else None),
         ("musicgen_melody", "T5Tokenizer" if is_tokenizers_available() else None),
         ("mvp", "RobertaTokenizer" if is_tokenizers_available() else None),
@@ -502,11 +504,13 @@ def _load_tokenizers_backend(tokenizer_class, pretrained_model_name_or_path, inp
             except Exception:
                 pass
 
-    # Try vocab.json + merges.txt using shared helper
     vocab, merges, loaded = load_vocab_and_merges(pretrained_model_name_or_path, **kwargs)
     if vocab is not None:
         files_loaded.extend(loaded)
-        kwargs["backend"] = "tokenizers"
+        if issubclass(tokenizer_class, PreTrainedTokenizer):
+            kwargs["backend"] = "python"
+        else:
+            kwargs["backend"] = "tokenizers"
         kwargs["files_loaded"] = files_loaded
         if merges is not None:
             return tokenizer_class.from_pretrained(
@@ -1015,6 +1019,8 @@ class AutoTokenizer:
             if fast_tokenizer_class is None:
                 tokenizer_class_candidate = config_tokenizer_class
                 tokenizer_class = tokenizer_class_from_name(tokenizer_class_candidate)
+                if tokenizer_class is None and not tokenizer_class_candidate.endswith("Fast"):
+                    tokenizer_class = tokenizer_class_from_name(tokenizer_class_candidate + "Fast")
             else:
                 tokenizer_class = fast_tokenizer_class
 
