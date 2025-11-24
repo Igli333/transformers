@@ -542,21 +542,21 @@ class DebertaConverter(Converter):
         return tokenizer
 
 
-class SpmConverter(Converter):
+class SpmConverter:
     handle_byte_fallback = False
     SpmExtractor = SentencePieceExtractor
     special_tokens = {}
 
-    def __init__(self, *args):
+    def __init__(self, original_tokenizer=None, vocab_file:Optional[str] = None, *args):
         requires_backends(self, "protobuf")
-
-        super().__init__(*args)
-
         # from .utils import sentencepiece_model_pb2 as model_pb2
         model_pb2 = import_protobuf()
+        if original_tokenizer is not None:
+            self.original_tokenizer = original_tokenizer
+            vocab_file = self.original_tokenizer.vocab_file
 
         m = model_pb2.ModelProto()
-        with open(self.original_tokenizer.vocab_file, "rb") as f:
+        with open(vocab_file, "rb") as f:
             m.ParseFromString(f.read())
         self.proto = m
 
@@ -568,32 +568,27 @@ class SpmConverter(Converter):
                 "unknown tokens into a sequence of byte tokens matching the original piece of text."
             )
 
-    def vocab(self, proto):
-        return [(piece.piece, piece.score) for piece in proto.pieces]
-
-    def unk_id(self, proto):
-        return proto.trainer_spec.unk_id
-
-    def tokenizer(self, proto):
+        proto = self.proto
         model_type = proto.trainer_spec.model_type
-        vocab_scores = self.vocab(proto)
+        self.vocab = self.vocab_(proto)
 
         if model_type == 1:
-            tokenizer = Tokenizer(
+            self.tokenizer = Tokenizer(
                 Unigram(
-                    vocab_scores,
+                    self.vocab,
                     unk_id=self.unk_id(proto),
                     byte_fallback=self.handle_byte_fallback,
                 )
             )
+            self.merges=None
 
         elif model_type == 2:
-            _, merges = self.SpmExtractor(self.original_tokenizer.vocab_file).extract(vocab_scores)
-            bpe_vocab = {word: i for i, (word, score) in enumerate(vocab_scores)}
-            tokenizer = Tokenizer(
+            _, self.merges = self.SpmExtractor(self.original_tokenizer.vocab_file).extract(self.vocab)
+            self.vocab = {word: i for i, (word, score) in enumerate(self.vocab)}
+            self.tokenizer = Tokenizer(
                 BPE(
-                    bpe_vocab,
-                    merges,
+                    self.vocab,
+                    self.merges,
                     unk_token=proto.trainer_spec.unk_piece,
                     fuse_unk=True,
                     byte_fallback=self.handle_byte_fallback,
@@ -605,7 +600,6 @@ class SpmConverter(Converter):
             raise Exception(
                 "You're trying to run a `Unigram` model but you're file was trained with a different algorithm"
             )
-
         # control tokens are special
         # user defined symbols are not
         # both user and control tokens are AddedTokens
@@ -615,13 +609,20 @@ class SpmConverter(Converter):
             for id, p in enumerate(proto.pieces)
             if p.type in [3, 4]
         ]
-        tokenizer.add_tokens(
-            [
+        self.special_tokens = [
                 AddedToken(token, normalized=False, special=special)
                 for id, token, special in sorted(spm_added_tokens, key=lambda x: x[0])
             ]
-        )
 
+
+    def vocab_(self, proto):
+        return [(piece.piece, piece.score) for piece in proto.pieces]
+
+    def unk_id(self, proto):
+        return proto.trainer_spec.unk_id
+
+    def tokenizer_(self, proto):
+        tokenizer = self.tokenizer
         return tokenizer
 
     def normalizer(self, proto):

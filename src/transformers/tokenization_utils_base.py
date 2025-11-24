@@ -993,12 +993,10 @@ class PreTrainedTokenizerBase(PushToHubMixin):
 
         # Directly set hidden values to allow init with tokens not yet in vocab
         for key in list(kwargs.keys()):
-            if key.endswith("_token"):
+            if key.endswith("_token") and isinstance(kwargs[key], (str, AddedToken)):
                 value = kwargs.pop(key)
                 if value is None:
                     continue
-                if not isinstance(value, (str, AddedToken)):
-                    raise TypeError(f"Token {key} has to be either str or AddedToken but got: {type(value)}")
                 # Store as mapping; resolution to ids happens later when vocab is available
                 self._token_mapping[key] = value if isinstance(value, int) else value
 
@@ -1033,12 +1031,6 @@ class PreTrainedTokenizerBase(PushToHubMixin):
             # Chat templates are stored as lists of dicts with fixed key names,
             # we reconstruct that into a single dict while loading them.
             self.chat_template = {template["name"]: template["template"] for template in self.chat_template}
-
-        # TODO just use `token_mapping` directly
-        model_specific_tokens = {**auto_model_specific_tokens, **explicit_model_specific_tokens}
-        if model_specific_tokens:
-            self._set_model_specific_special_tokens(special_tokens=model_specific_tokens)
-
         self.deprecation_warnings = {}
 
         # Backend information (V5: tracking which backend and files were used)
@@ -1374,7 +1366,7 @@ class PreTrainedTokenizerBase(PushToHubMixin):
             f"{self.__class__.__name__}(name_or_path='{self.name_or_path}',"
             f" vocab_size={self.vocab_size}, model_max_length={self.model_max_length},"
             f" padding_side='{self.padding_side}', truncation_side='{self.truncation_side}',"
-            f" special_tokens={self.special_tokens_map},"
+            f" special_tokens={self._token_mapping},"
             " added_tokens_decoder={\n\t" + added_tokens_decoder_rep + "\n}\n)"
         )
 
@@ -1725,7 +1717,6 @@ class PreTrainedTokenizerBase(PushToHubMixin):
             with open(tokenizer_config_file, encoding="utf-8") as tokenizer_config_handle:
                 init_kwargs = json.load(tokenizer_config_handle)
             # First attempt. We get tokenizer_class from tokenizer_config to check mismatch between tokenizers.
-            config_tokenizer_class = init_kwargs.get("tokenizer_class")
             init_kwargs.pop("tokenizer_class", None)
             if not has_tokenizer_file:
                 init_kwargs.get("tokenizer_file", None)
@@ -1733,7 +1724,6 @@ class PreTrainedTokenizerBase(PushToHubMixin):
             if not init_inputs:
                 init_inputs = saved_init_inputs
         else:
-            config_tokenizer_class = None
             init_kwargs = init_configuration
 
         # If independent chat template file(s) exist, they take priority over template entries in the tokenizer config

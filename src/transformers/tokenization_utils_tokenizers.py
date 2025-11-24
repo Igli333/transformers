@@ -152,20 +152,16 @@ class TokenizersBackend(PreTrainedTokenizerBase):
         # if some of the special tokens are not already in the tokenizer, add them
         # V5: Check both named special tokens and extra special tokens
         # Iterate over _special_tokens_map to preserve AddedToken properties (lstrip, rstrip, etc.)
-        for special_token_value in self._special_tokens_map.values():
+        for special_token_value in self._token_mapping.values():
             if special_token_value is None:
                 continue
             if str(special_token_value) not in encoder and special_token_value not in tokens_to_add:
                 tokens_to_add.append(special_token_value)
 
-        # Also check extra special tokens
-        for token in self._extra_special_tokens:
-            if str(token) not in encoder and token not in tokens_to_add:
-                tokens_to_add.append(token)
 
         if len(tokens_to_add) > 0:
             tokens = []
-            all_named_tokens = [str(t) for t in self._special_tokens_map.values() if t]
+            all_named_tokens = [str(t) for t in self._token_mapping.values() if t]
             for token in tokens_to_add:
                 if isinstance(token, str):
                     # Convert string to AddedToken, assuming it's special
@@ -178,6 +174,17 @@ class TokenizersBackend(PreTrainedTokenizerBase):
             if tokens:
                 # These tokens are from the special tokens map
                 self.add_tokens(tokens, special_tokens=True)
+
+    def __repr__(self) -> str:
+        added_tokens_decoder_rep = "\n\t".join([f"{k}: {v.__repr__()}," for k, v in self.added_tokens_decoder.items()])
+        return (
+            f"{self.__class__.__name__}(name_or_path='{self.name_or_path}',\n"
+            f" _tokenizer={self._tokenizer},\n"
+            f" vocab_size={self.vocab_size}, model_max_length={self.model_max_length},\n"
+            f" padding_side='{self.padding_side}', truncation_side='{self.truncation_side}',\n"
+            f" special_tokens={self._token_mapping},\n"
+            " added_tokens_decoder={\n\t" + added_tokens_decoder_rep + "\n}\n)"
+        )
 
     @classmethod
     def _from_pretrained(
@@ -232,12 +239,6 @@ class TokenizersBackend(PreTrainedTokenizerBase):
         if not _is_local:
             if "auto_map" in init_kwargs and isinstance(init_kwargs["auto_map"], (tuple, list)):
                 init_kwargs["auto_map"] = {"AutoTokenizer": init_kwargs["auto_map"]}
-
-        extra_special_tokens_from_config = init_kwargs.get("extra_special_tokens")
-        if isinstance(extra_special_tokens_from_config, (list, tuple)):
-            extra_special_tokens_from_config = list(extra_special_tokens_from_config)
-        else:
-            extra_special_tokens_from_config = None
 
         init_kwargs.update(kwargs)
         init_kwargs["name_or_path"] = pretrained_model_name_or_path
@@ -298,28 +299,29 @@ class TokenizersBackend(PreTrainedTokenizerBase):
                     vocab, merges = converter.vocab, converter.merges
                 all_special = converter.additional_special_tokens
                 init_kwargs.setdefault("additional_special_tokens", all_special)
-            elif os.path.basename(vocab_file).startswith("tokenizer.model"):
+            elif os.path.basename(vocab_file).endswith(".model"):
                 from .convert_slow_tokenizer import TikTokenConverter
-
-                converter = TikTokenConverter(
-                    vocab_file=vocab_file,
-                    add_prefix_space=init_kwargs.get("add_prefix_space", False),
-                    extra_special_tokens=init_kwargs.get("extra_special_tokens"),
-                )
                 try:
-                    if cls is TokenizersBackend:
-                        tokenizer_object = converter.converted()
-                    else:
-                        vocab, merges = converter.vocab, converter.merges
+                    converter = TikTokenConverter(
+                        vocab_file=vocab_file,
+                        add_prefix_space=init_kwargs.get("add_prefix_space", False),
+                        extra_special_tokens=init_kwargs.get("extra_special_tokens"),
+                    )
+
                 except Exception as _:
                     from .convert_slow_tokenizer import SpmConverter
                     try:
-                        vocab, merges = SpmConverter.SpmExtractor(vocab_file).extract()
+                        converter = SpmConverter(vocab_file=vocab_file)
                     except Exception as e:
                         raise OSError(
                             "Unable to read tokenizer vocabulary. Please ensure you have the required "
                             "`sentencepiece` dependency installed."
                         ) from e
+
+                if cls is TokenizersBackend:
+                    tokenizer_object = converter.converted()
+                else:
+                    vocab, merges = converter.vocab, converter.merges
 
         if added_tokens_decoder:
             init_kwargs["added_tokens_decoder"] = added_tokens_decoder
@@ -619,6 +621,10 @@ class TokenizersBackend(PreTrainedTokenizerBase):
     @property
     def vocab(self) -> dict[str, int]:
         return self.get_vocab()
+    
+    @property
+    def all_special_tokens(self) -> list[str]:
+        return self._tokenizer.added_tokens_specials()
 
     @property
     def added_tokens_encoder(self) -> dict[str, int]:
