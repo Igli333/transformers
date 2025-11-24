@@ -177,6 +177,7 @@ class GraniteMoeHybridConfig(PretrainedConfig):
         mamba_chunk_size=256,
         mamba_conv_bias=True,
         mamba_proj_bias=False,
+        routing_policy="top_k",
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -235,6 +236,7 @@ class GraniteMoeHybridConfig(PretrainedConfig):
         self.mamba_proj_bias = mamba_proj_bias
         self.mamba_expand = mamba_expand
         self.layer_types = layer_types
+        self.routing_policy = routing_policy
 
         super().__init__(
             pad_token_id=pad_token_id,

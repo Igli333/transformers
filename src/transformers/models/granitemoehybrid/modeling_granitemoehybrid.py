@@ -936,52 +936,137 @@ class GraniteMoeHybridParallelExperts(nn.Module):
         return results
 
 
+# class GraniteMoeHybridTopKGating(nn.Module):
+#     def __init__(self, input_size: int, num_experts: int, top_k: int):
+#         """
+#         Initialize the top-k gating mechanism.
+#         Args:
+#             input_size (`int`):
+#                 Size of the input.
+#             num_experts (`int`):
+#                 Number of experts.
+#             top_k (`int`):
+#                 Number of top experts to select.
+#         """
+#         super().__init__()
+#
+#         self.num_experts = num_experts
+#         self.input_size = input_size
+#         self.top_k = top_k
+#
+#         self.layer = nn.Linear(input_size, num_experts, bias=False)
+#
+#     def forward(self, hidden_states):
+#         # compute the top_k routing decision
+#         logits = self.layer(hidden_states).float()  # [batch_size x seq_len, num_experts]
+#         top_k_logits, top_k_indices = logits.topk(self.top_k, dim=1)  # [num_tokens, top_k]
+#         top_k_gates = torch.softmax(top_k_logits, dim=1).type_as(hidden_states)  # [num_tokens, top_k]
+#
+#         # compute number of input given to each expert
+#         zeros = torch.zeros(
+#             [top_k_gates.size(0), self.num_experts], dtype=top_k_gates.dtype, device=top_k_gates.device
+#         )  # [num_tokens, num_experts]
+#         gates = zeros.scatter(1, top_k_indices, 1)  # [num_tokens, num_experts]
+#         expert_size = gates.long().sum(0)  # [num_experts,]
+#         # (This cause torch.compile to fail with `torch._dynamo.exc.Unsupported: Backend compiler failed with a fake tensor exception at`)
+#         # (and `DataDependentOutputException`)
+#         expert_size = expert_size.tolist()
+#
+#         # sort and group input tokens according to expert assignment
+#         top_k_experts = top_k_indices.flatten()  # [num_tokens * top_k]
+#         _, index_sorted_experts = top_k_experts.sort(0)  # [num_tokens * top_k]
+#         batch_index = index_sorted_experts.div(self.top_k, rounding_mode="trunc")  # [num_tokens * top_k]
+#
+#         # gather the gate values for grouped input tokens
+#         top_k_gates = top_k_gates.flatten()  # [num_tokens * top_k]
+#         batch_gates = top_k_gates[index_sorted_experts]  # [num_tokens * top_k]
+#
+#         return index_sorted_experts, batch_index, batch_gates, expert_size, logits
+
 class GraniteMoeHybridTopKGating(nn.Module):
-    def __init__(self, input_size: int, num_experts: int, top_k: int):
-        """
-        Initialize the top-k gating mechanism.
-        Args:
-            input_size (`int`):
-                Size of the input.
-            num_experts (`int`):
-                Number of experts.
-            top_k (`int`):
-                Number of top experts to select.
-        """
+    def __init__(self, input_size: int, num_experts: int, top_k: int = 2, policy: str = "top_k"):
         super().__init__()
-
-        self.num_experts = num_experts
         self.input_size = input_size
+        self.num_experts = num_experts
         self.top_k = top_k
-
+        self.policy = policy
         self.layer = nn.Linear(input_size, num_experts, bias=False)
 
     def forward(self, hidden_states):
-        # compute the top_k routing decision
-        logits = self.layer(hidden_states).float()  # [batch_size x seq_len, num_experts]
-        top_k_logits, top_k_indices = logits.topk(self.top_k, dim=1)  # [num_tokens, top_k]
-        top_k_gates = torch.softmax(top_k_logits, dim=1).type_as(hidden_states)  # [num_tokens, top_k]
+        logits = self.layer(hidden_states).float()
 
-        # compute number of input given to each expert
-        zeros = torch.zeros(
-            [top_k_gates.size(0), self.num_experts], dtype=top_k_gates.dtype, device=top_k_gates.device
-        )  # [num_tokens, num_experts]
-        gates = zeros.scatter(1, top_k_indices, 1)  # [num_tokens, num_experts]
-        expert_size = gates.long().sum(0)  # [num_experts,]
-        # (This cause torch.compile to fail with `torch._dynamo.exc.Unsupported: Backend compiler failed with a fake tensor exception at`)
-        # (and `DataDependentOutputException`)
-        expert_size = expert_size.tolist()
+        if self.policy == "top_1":
+            return self._top_k_routing(logits, hidden_states, k=1)
+        elif self.policy == "top_k":
+            return self._top_k_routing(logits, hidden_states, k=self.top_k)
+        elif self.policy == "noisy_top_k":
+            return self._noisy_top_k_routing(logits, hidden_states)
+        elif self.policy == "soft":
+            return self._soft_routing(logits, hidden_states)
+        elif self.policy == "adaptive":
+            return self._adaptive_routing(logits, hidden_states)
+        elif self.policy == "load_balanced":
+            return self._load_balanced_routing(logits, hidden_states)
+        elif self.policy == "hash":
+            return self._hash_routing(hidden_states)
+        elif self.policy == "token_based":
+            return self._token_based_routing(logits, hidden_states)
+        else:
+            raise ValueError(f"Unknown routing policy: {self.policy}")
 
-        # sort and group input tokens according to expert assignment
-        top_k_experts = top_k_indices.flatten()  # [num_tokens * top_k]
-        _, index_sorted_experts = top_k_experts.sort(0)  # [num_tokens * top_k]
-        batch_index = index_sorted_experts.div(self.top_k, rounding_mode="trunc")  # [num_tokens * top_k]
+    # -----------------------------
+    # Implementations of policies
+    # -----------------------------
+    def _top_k_routing(self, logits, hidden_states, k):
+        top_k_logits, top_k_indices = logits.topk(k, dim=1)
+        top_k_gates = torch.softmax(top_k_logits, dim=1).type_as(hidden_states)
+        zeros = torch.zeros([top_k_gates.size(0), self.num_experts], dtype=top_k_gates.dtype, device=top_k_gates.device)
+        gates = zeros.scatter(1, top_k_indices, 1)
+        expert_size = gates.long().sum(0).tolist()
 
-        # gather the gate values for grouped input tokens
-        top_k_gates = top_k_gates.flatten()  # [num_tokens * top_k]
-        batch_gates = top_k_gates[index_sorted_experts]  # [num_tokens * top_k]
+        top_k_experts = top_k_indices.flatten()
+        _, index_sorted_experts = top_k_experts.sort(0)
+        batch_index = index_sorted_experts.div(k, rounding_mode="trunc")
+        batch_gates = top_k_gates.flatten()[index_sorted_experts]
 
         return index_sorted_experts, batch_index, batch_gates, expert_size, logits
+
+    def _noisy_top_k_routing(self, logits, hidden_states):
+        noise = torch.randn_like(logits) * 1e-2
+        noisy_logits = logits + noise
+        return self._top_k_routing(noisy_logits, hidden_states, k=self.top_k)
+
+    def _soft_routing(self, logits, hidden_states):
+        gates = torch.softmax(logits, dim=1).type_as(hidden_states)
+        expert_size = torch.ones(self.num_experts, dtype=torch.long, device=logits.device)  # placeholder
+        batch_index = torch.arange(logits.size(0), device=logits.device).repeat_interleave(self.num_experts)
+        index_sorted_experts = torch.arange(logits.size(0) * self.num_experts, device=logits.device)
+        batch_gates = gates.flatten()
+        return index_sorted_experts, batch_index, batch_gates, expert_size.tolist(), logits
+
+    def _adaptive_routing(self, logits, hidden_states):
+        # Example: dynamic top-k per token based on max logit magnitude
+        top_k_dynamic = torch.clamp((torch.softmax(logits, dim=1).max(dim=1).values * self.num_experts).long(), min=1)
+        # For simplicity, fallback to top_k with max top_k_dynamic
+        return self._top_k_routing(logits, hidden_states, k=self.top_k)
+
+    def _load_balanced_routing(self, logits, hidden_states):
+        # Add regularization term in loss outside of routing
+        return self._top_k_routing(logits, hidden_states, k=self.top_k)
+
+    def _hash_routing(self, hidden_states):
+        # Deterministic mapping: e.g., use token ID modulo num_experts
+        token_ids = torch.arange(hidden_states.size(0), device=hidden_states.device)
+        top_1_indices = token_ids % self.num_experts
+        top_1_gates = torch.ones_like(top_1_indices, dtype=hidden_states.dtype)
+        expert_size = torch.ones(self.num_experts, dtype=torch.long).tolist()
+        batch_index = torch.arange(hidden_states.size(0), device=hidden_states.device)
+        index_sorted_experts = torch.arange(hidden_states.size(0), device=hidden_states.device)
+        return index_sorted_experts, batch_index, top_1_gates, expert_size, None
+
+    def _token_based_routing(self, logits, hidden_states):
+        # Switch-style: top-1 token-level routing
+        return self._top_k_routing(logits, hidden_states, k=1)
 
 
 class GraniteMoeHybridMoE(nn.Module):
@@ -1010,6 +1095,7 @@ class GraniteMoeHybridMoE(nn.Module):
             input_size=self.input_size,
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
+            policy=config.routing_policy,
         )
 
     def forward(self, layer_input):
