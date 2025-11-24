@@ -1632,6 +1632,12 @@ class TikTokenConverter:
         self.extra_special_tokens = (
             extra_special_tokens.keys() if isinstance(extra_special_tokens, dict) else extra_special_tokens
         )
+        if self.extra_special_tokens is None:
+            self.extra_special_tokens = []
+        vocab_scores, merges = self.extract_vocab_merges_from_model(vocab_file)
+        self.vocab_scores = vocab_scores
+        self.vocab = vocab_scores
+        self.merges = merges
 
     def extract_vocab_merges_from_model(self, tiktoken_url: str):
         try:
@@ -1665,8 +1671,7 @@ class TikTokenConverter:
         return vocab, merges
 
     def tokenizer(self):
-        vocab_scores, merges = self.extract_vocab_merges_from_model(self.vocab_file)
-        tokenizer = Tokenizer(BPE(vocab_scores, merges, fuse_unk=False))
+        tokenizer = Tokenizer(BPE(self.vocab_scores, self.merges, fuse_unk=False))
         if hasattr(tokenizer.model, "ignore_merges"):
             tokenizer.model.ignore_merges = True
         return tokenizer
