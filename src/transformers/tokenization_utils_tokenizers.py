@@ -32,10 +32,6 @@ from tokenizers import normalizers as tokenizers_normalizers
 from tokenizers.decoders import Decoder as DecoderFast
 from tokenizers.trainers import BpeTrainer, UnigramTrainer, WordLevelTrainer, WordPieceTrainer
 
-from .convert_slow_tokenizer import convert_slow_tokenizer
-from .integrations.ggml import convert_gguf_tokenizer
-from .modeling_gguf_pytorch_utils import load_gguf_checkpoint
-from .tokenization_python import PreTrainedTokenizer
 from .tokenization_utils_base import (
     INIT_TOKENIZER_DOCSTRING,
     AddedToken,
@@ -95,57 +91,26 @@ class TokenizersBackend(PreTrainedTokenizerBase):
     vocab_files_names = VOCAB_FILES_NAMES
 
     def __init__(self, *args, **kwargs):
+        # TokenizersBackend expects a prepared tokenizer object; subclasses build it.
+        fast_tokenizer = None
         tokenizer_object = kwargs.pop("tokenizer_object", None)
-        slow_tokenizer = kwargs.pop("__slow_tokenizer", None)
-        gguf_file = kwargs.pop("gguf_file", None)
         fast_tokenizer_file = kwargs.pop("tokenizer_file", None)
-        # Note: added_tokens_decoder is NOT popped - it's passed to super().__init__() for processing
         added_tokens_decoder = kwargs.get("added_tokens_decoder", {})
         # Store add_prefix_space before super().__init__() to ensure it's not overridden
         add_prefix_space = kwargs.get("add_prefix_space", False)
 
+        self._tokenizer = getattr(self, "_tokenizer", None)
+
         if tokenizer_object is not None:
             fast_tokenizer = copy.deepcopy(tokenizer_object)
         elif fast_tokenizer_file is not None:
-            # We have a serialization from tokenizers which let us directly build the backend
             fast_tokenizer = TokenizerFast.from_file(fast_tokenizer_file)
-        elif slow_tokenizer:
-            # We need to convert a slow tokenizer to build the backend
-            fast_tokenizer = convert_slow_tokenizer(slow_tokenizer)
-        elif gguf_file is not None:
-            # We need to convert a slow tokenizer to build the backend
-            gguf_param = load_gguf_checkpoint(kwargs.get("vocab_file"))
-            architecture = gguf_param["config"]["model_type"]
-            tokenizer_dict = gguf_param["tokenizer"]
-            tokenizer_config = gguf_param["tokenizer_config"]
-            fast_tokenizer, additional_kwargs = convert_gguf_tokenizer(architecture, tokenizer_dict)
-            kwargs.update(tokenizer_config)
-            if len(additional_kwargs) > 0:
-                kwargs.update(additional_kwargs)
-        elif self.slow_tokenizer_class is not None and slow_tokenizer is not False:
-            # We need to create and convert a slow tokenizer to build the backend
-            slow_tokenizer = self.slow_tokenizer_class(*args, **kwargs)
-            fast_tokenizer = convert_slow_tokenizer(slow_tokenizer)
-        elif not slow_tokenizer:
-            # We tried loading a slow_tokenizer with spm and failed, try to load with tiktoken
-            self.vocab_file = kwargs.get("vocab_file")
-            # V5: Set _extra_special_tokens directly for converter
-            self._extra_special_tokens = kwargs.get("extra_special_tokens", [])
-            fast_tokenizer = convert_slow_tokenizer(self, from_tiktoken=True)
-            slow_tokenizer = None
-        else:
-            raise ValueError(
-                "Couldn't instantiate the backend tokenizer from one of: \n"
-                "(1) a `tokenizers` library serialization file, \n"
-                "(2) a slow tokenizer instance to convert or \n"
-                "(3) an equivalent slow tokenizer class to instantiate and convert. \n"
-                "You need to have sentencepiece or tiktoken installed to convert a slow tokenizer to a fast one."
-            )
 
-        self._tokenizer = fast_tokenizer
-
-        if slow_tokenizer is not None:
-            kwargs.update(slow_tokenizer.init_kwargs)
+        # if the class defined it itself:
+        if fast_tokenizer is not None:
+            self._tokenizer = fast_tokenizer
+        elif self._tokenizer is None:
+            raise ValueError("You have to call `super().__init__()` in your tokenizer class after your initialize `self._tokenizer`.")
 
         _truncation = self._tokenizer.truncation
 
@@ -246,29 +211,198 @@ class TokenizersBackend(PreTrainedTokenizerBase):
         if not init_inputs:
             init_inputs = saved_init_inputs
 
+        chat_templates = {}
+        chat_template_file = resolved_vocab_files.get("chat_template_file")
+        extra_chat_templates = [key for key in resolved_vocab_files if key.startswith("chat_template_")]
+        if chat_template_file is not None:
+            with open(chat_template_file, encoding="utf-8") as chat_template_handle:
+                chat_templates["default"] = chat_template_handle.read()
+        for extra_chat_template in extra_chat_templates:
+            template_file = resolved_vocab_files.get(extra_chat_template)
+            if template_file is None:
+                continue
+            template_name = extra_chat_template.removeprefix("chat_template_")
+            with open(template_file) as chat_template_handle:
+                chat_templates[template_name] = chat_template_handle.read()
+        if len(chat_templates) == 1 and "default" in chat_templates:
+            init_kwargs["chat_template"] = chat_templates["default"]
+        elif chat_templates:
+            init_kwargs["chat_template"] = chat_templates
+
+        if not _is_local:
+            if "auto_map" in init_kwargs and isinstance(init_kwargs["auto_map"], (tuple, list)):
+                init_kwargs["auto_map"] = {"AutoTokenizer": init_kwargs["auto_map"]}
+
+        extra_special_tokens_from_config = init_kwargs.get("extra_special_tokens")
+        if isinstance(extra_special_tokens_from_config, (list, tuple)):
+            extra_special_tokens_from_config = list(extra_special_tokens_from_config)
+        else:
+            extra_special_tokens_from_config = None
+
         init_kwargs.update(kwargs)
         init_kwargs["name_or_path"] = pretrained_model_name_or_path
+        files_loaded = init_kwargs.pop("files_loaded", [])
 
-        if special_tokens_map_file is not None:
-            with open(special_tokens_map_file, encoding="utf-8") as special_tokens_map_handle:
-                special_tokens_map = json.load(special_tokens_map_handle)
-            for key, value in special_tokens_map.items():
-                if key in kwargs and kwargs[key]:
-                    continue
-                if isinstance(value, dict):
-                    value["special"] = True
-                    value = AddedToken(**value)
-                init_kwargs.setdefault(key, value)
+        tokenizer_json = None
+        tokenizer_object = None
+        vocab = None
+        merges = None
+
+        if tokenizer_file is not None and os.path.isfile(tokenizer_file):
+            files_loaded.append(os.path.basename(tokenizer_file))
+            with open(tokenizer_file, encoding="utf-8") as tokenizer_handle:
+                tokenizer_json = json.load(tokenizer_handle)
+                token_mapping = tokenizer_json.get("token_mapping")
+                if token_mapping is not None:
+                    init_kwargs.setdefault("token_mapping", token_mapping)
+
+        # Populate added_tokens_decoder (legacy) while keeping token_mapping untouched; legacy files only if mapping is absent
+        init_kwargs, added_tokens_decoder, added_tokens_map = cls._load_added_tokens(
+            init_kwargs=init_kwargs,
+            tokenizer_json=tokenizer_json,
+            special_tokens_map_file=special_tokens_map_file,
+            added_tokens_file=added_tokens_file,
+            user_kwargs=kwargs,
+        )
+
+        if tokenizer_json is not None:
+            if cls is TokenizersBackend:
+                tokenizer_object = TokenizerFast.from_file(tokenizer_file)
+            else:
+                tokenizer_model = tokenizer_json.get("model", {})
+                vocab = tokenizer_model.get("vocab")
+                if isinstance(vocab, list):
+                    vocab = {token: idx for idx, token in enumerate(vocab)}
+
+                raw_merges = tokenizer_model.get("merges")
+                if raw_merges is not None:
+                    merges = []
+                    for merge in raw_merges:
+                        if isinstance(merge, str):
+                            parts = merge.split()
+                        elif isinstance(merge, (list, tuple)) and len(merge) >= 2:
+                            parts = merge[:2]
+                        else:
+                            continue
+                        if len(parts) == 2:
+                            merges.append((parts[0], parts[1]))
+
+        if tokenizer_json is None and vocab_file is not None:
+            files_loaded.append(os.path.basename(vocab_file))
+            if os.path.basename(vocab_file).startswith("tekken"):
+                from .integrations.mistral import MistralConverter
+                converter = MistralConverter(vocab=vocab_file)
+                if cls is TokenizersBackend:
+                    tokenizer_object = converter.converted()
+                else:
+                    vocab, merges = converter.vocab, converter.merges
+                all_special = converter.additional_special_tokens
+                init_kwargs.setdefault("additional_special_tokens", all_special)
+            elif os.path.basename(vocab_file).startswith("tokenizer.model"):
+                from .convert_slow_tokenizer import TikTokenConverter
+
+                converter = TikTokenConverter(
+                    vocab_file=vocab_file,
+                    add_prefix_space=init_kwargs.get("add_prefix_space", False),
+                    extra_special_tokens=init_kwargs.get("extra_special_tokens"),
+                )
+                try:
+                    if cls is TokenizersBackend:
+                        tokenizer_object = converter.converted()
+                    else:
+                        vocab, merges = converter.vocab, converter.merges
+                except Exception as _:
+                    from .convert_slow_tokenizer import SpmConverter
+                    try:
+                        vocab, merges = SpmConverter.SpmExtractor(vocab_file).extract()
+                    except Exception as e:
+                        raise OSError(
+                            "Unable to read tokenizer vocabulary. Please ensure you have the required "
+                            "`sentencepiece` dependency installed."
+                        ) from e
+
+        if added_tokens_decoder:
+            init_kwargs["added_tokens_decoder"] = added_tokens_decoder
+            init_kwargs = cls.convert_added_tokens(init_kwargs, save=False)
+            for key in cls.SPECIAL_TOKENS_ATTRIBUTES:
+                if key in init_kwargs and added_tokens_map and init_kwargs[key] is not None:
+                    init_kwargs[key] = added_tokens_map.get(str(init_kwargs[key]), init_kwargs[key])
+
+        init_kwargs.setdefault("backend", "tokenizers")
+        if files_loaded and "files_loaded" not in init_kwargs:
+            init_kwargs["files_loaded"] = files_loaded
+
+        class_sig = inspect.signature(getattr(cls, "__init__", cls))
+        accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in class_sig.parameters.values())
+        if tokenizer_object is not None and "tokenizer_object" in class_sig.parameters:
+            init_kwargs.setdefault("tokenizer_object", tokenizer_object)
+        if vocab is not None and ("vocab" in class_sig.parameters or accepts_kwargs):
+            init_kwargs.setdefault("vocab", vocab)
+        if merges is not None and ("merges" in class_sig.parameters or accepts_kwargs):
+            init_kwargs.setdefault("merges", merges)
+        # TODO handle other arguments?
+        tokenizer = cls(*init_inputs, **init_kwargs)
+        return tokenizer
+
+    @classmethod
+    def _load_added_tokens(
+        cls,
+        init_kwargs: dict[str, Any],
+        tokenizer_json: Optional[dict[str, Any]],
+        special_tokens_map_file: Optional[str],
+        added_tokens_file: Optional[str],
+        user_kwargs: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[int, AddedToken], dict[str, AddedToken]]:
+        """
+        Prepare added tokens to pass to the tokenizer initializer.
+
+        Priority order:
+        1. `tokenizer.json` added_tokens if present.
+        2. `added_tokens_decoder` serialized in tokenizer_config.json.
+        3. Legacy `special_tokens_map.json` + `added_tokens.json` files.
+        """
 
         added_tokens_decoder: dict[int, AddedToken] = {}
         added_tokens_map: dict[str, AddedToken] = {}
+
+        def _record(token_obj: AddedToken, idx: int):
+            added_tokens_decoder[int(idx)] = token_obj
+            added_tokens_map[str(token_obj)] = token_obj
+
+        # Priority 1: added tokens from tokenizer.json
+        if tokenizer_json is not None:
+            json_added_tokens = tokenizer_json.get("added_tokens", [])
+            for serialized_tokens in json_added_tokens:
+                serialized_tokens = serialized_tokens.copy()
+                idx = serialized_tokens.pop("id")
+                _record(AddedToken(**serialized_tokens), idx)
+            if added_tokens_decoder:
+                return init_kwargs, added_tokens_decoder, added_tokens_map
+
+        # Priority 2: added_tokens_decoder serialized in tokenizer_config.json
         if "added_tokens_decoder" in init_kwargs:
             for idx, token_obj in init_kwargs["added_tokens_decoder"].items():
                 if isinstance(token_obj, dict):
                     token_obj = AddedToken(**token_obj)
-                added_tokens_decoder[int(idx)] = token_obj
-                added_tokens_map[str(token_obj)] = token_obj
-        elif added_tokens_file is not None:
+                _record(token_obj, idx)
+            return init_kwargs, added_tokens_decoder, added_tokens_map
+
+        # Priority 3: legacy files (only if no token_mapping and no tokenizer.json mapping)
+        if tokenizer_json is None and special_tokens_map_file is not None:
+            with open(special_tokens_map_file, encoding="utf-8") as special_tokens_map_handle:
+                special_tokens_map = json.load(special_tokens_map_handle)
+            for key, value in special_tokens_map.items():
+                if key in user_kwargs and user_kwargs[key]:
+                    continue
+                if isinstance(value, dict):
+                    value["special"] = True
+                    value = AddedToken(**value)
+                elif key == "extra_special_tokens" and isinstance(value, dict):
+                    init_kwargs.setdefault("model_specific_special_tokens", value)
+                    continue
+                init_kwargs.setdefault(key, value)
+
+        if added_tokens_file is not None:
             special_tokens = []
             for key in cls.SPECIAL_TOKENS_ATTRIBUTES:
                 if key in init_kwargs and init_kwargs[key] is not None:
@@ -284,127 +418,9 @@ class TokenizersBackend(PreTrainedTokenizerBase):
                 added_token = AddedToken(
                     str_token, rstrip=False, lstrip=False, normalized=not special, special=special
                 )
-                added_tokens_decoder[int(index)] = added_token
-                added_tokens_map[str_token] = added_token
+                _record(added_token, index)
 
-        tokenizer_json = None
-        vocab = None
-        merges = None
-        files_loaded = []
-        tokenizer_object = None
-
-        if tokenizer_file is not None and os.path.isfile(tokenizer_file):
-            files_loaded.append(os.path.basename(tokenizer_file))
-            with open(tokenizer_file, encoding="utf-8") as tokenizer_handle:
-                tokenizer_json = json.load(tokenizer_handle)
-
-            for serialized_tokens in tokenizer_json.get("added_tokens", []):
-                serialized_tokens = serialized_tokens.copy()
-                idx = serialized_tokens.pop("id")
-                added_tokens_decoder[int(idx)] = AddedToken(**serialized_tokens)
-                added_tokens_map[str(added_tokens_decoder[idx])] = added_tokens_decoder[idx]
-
-            try:
-                tokenizer_object = TokenizerFast.from_file(tokenizer_file)
-            except Exception:
-                tokenizer_object = None
-
-            tokenizer_model = tokenizer_json.get("model", {})
-            vocab = tokenizer_model.get("vocab")
-            if isinstance(vocab, list):
-                vocab = {token: idx for idx, token in enumerate(vocab)}
-
-            raw_merges = tokenizer_model.get("merges")
-            if raw_merges is not None:
-                merges = []
-                for merge in raw_merges:
-                    if isinstance(merge, str):
-                        parts = merge.split()
-                    elif isinstance(merge, (list, tuple)) and len(merge) >= 2:
-                        parts = merge[:2]
-                    else:
-                        continue
-                    if len(parts) == 2:
-                        merges.append((parts[0], parts[1]))
-
-        if tokenizer_json is None and vocab_file is not None:
-            files_loaded.append(os.path.basename(vocab_file))
-            if os.path.basename(vocab_file).startswith("tekken"):
-                try:
-                    from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
-
-                    from .integrations.mistral import MistralConverter
-                except Exception as e:
-                    raise ImportError(
-                        "Loading a Tekken tokenizer requires `mistral-common`. Install it with "
-                        "`pip install transformers[mistral-common]`."
-                    ) from e
-
-                mistral_tokenizer = MistralTokenizer.from_file(vocab_file)
-                vocab = mistral_tokenizer.instruct_tokenizer.tokenizer._tekken_token2id_nospecial
-                all_special = [
-                    token.value if hasattr(token, "value") else token
-                    for token in mistral_tokenizer.instruct_tokenizer.tokenizer._all_special_tokens
-                ]
-                converter = MistralConverter(vocab=vocab, additional_special_tokens=all_special)
-                tokenizer_object = converter.converted()
-                vocab, merges = converter.extract_vocab_merges_from_model(vocab)
-                init_kwargs.setdefault("additional_special_tokens", all_special)
-            else:
-                try:
-                    from .convert_slow_tokenizer import TikTokenConverter
-                except Exception:
-                    TikTokenConverter = None
-
-                if TikTokenConverter is not None:
-                    try:
-                        converter = TikTokenConverter(
-                            vocab_file=vocab_file,
-                            add_prefix_space=init_kwargs.get("add_prefix_space", False),
-                            extra_special_tokens=init_kwargs.get("extra_special_tokens"),
-                        )
-                        vocab, merges = converter.extract_vocab_merges_from_model(vocab_file)
-                        tokenizer_object = converter.converted()
-                    except Exception:
-                        converter = None
-
-                if tokenizer_object is None and vocab is None:
-                    try:
-                        from .convert_slow_tokenizer import SpmConverter
-
-                        vocab, vocab_scores, merges = SpmConverter.SpmExtractor(vocab_file).extract()
-                        vocab = vocab_scores if vocab is None else vocab
-                    except Exception as e:
-                        raise OSError(
-                            "Unable to read tokenizer vocabulary. Please ensure you have the required "
-                            "`sentencepiece` dependency installed."
-                        ) from e
-
-        init_kwargs["added_tokens_decoder"] = added_tokens_decoder
-        init_kwargs = cls.convert_added_tokens(init_kwargs, save=False)
-        for key in cls.SPECIAL_TOKENS_ATTRIBUTES:
-            if key in init_kwargs and added_tokens_map and init_kwargs[key] is not None:
-                init_kwargs[key] = added_tokens_map.get(str(init_kwargs[key]), init_kwargs[key])
-
-        init_kwargs.setdefault("backend", "tokenizers")
-        if files_loaded and "files_loaded" not in init_kwargs:
-            init_kwargs["files_loaded"] = files_loaded
-
-        class_sig = inspect.signature(getattr(cls, "__init__", cls))
-        if tokenizer_object is not None and "tokenizer_object" in class_sig.parameters:
-            init_kwargs.setdefault("tokenizer_object", tokenizer_object)
-
-        if vocab is not None and "vocab" in class_sig.parameters:
-            init_kwargs.setdefault("vocab", vocab)
-        if merges is not None and "merges" in class_sig.parameters:
-            init_kwargs.setdefault("merges", merges)
-
-        tokenizer = cls(*init_inputs, **init_kwargs)
-
-        if tokenizer_object is not None and cls is TokenizersBackend:
-            tokenizer._tokenizer = tokenizer_object
-
-        return tokenizer
+        return init_kwargs, added_tokens_decoder, added_tokens_map
 
     @property
     def is_fast(self) -> bool:
