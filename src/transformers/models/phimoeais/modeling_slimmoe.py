@@ -26,6 +26,7 @@ from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from ...activations import ACT2FN
+from ...generation import GenerationMixin
 from ...cache_utils import Cache, DynamicCache
 from ...modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask,
@@ -1538,7 +1539,7 @@ class PhiMoEModel(PhiMoEPreTrainedModel):
         )
 
 
-class PhiMoEForCausalLM(PhiMoEPreTrainedModel):
+class PhiMoEForCausalLM(PhiMoEPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
