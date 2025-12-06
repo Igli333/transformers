@@ -135,6 +135,7 @@ class PhiMoEConfig(PretrainedConfig):
             sliding_window=None,
             attention_dropout=0.0,
             num_experts_per_tok=2,
+            top_k=2,
             num_local_experts=16,
             output_router_logits=False,
             router_aux_loss_coef=0.001,
@@ -170,6 +171,7 @@ class PhiMoEConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
 
         self.num_experts_per_tok = num_experts_per_tok
+        self.top_k = top_k
         self.num_local_experts = num_local_experts
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef

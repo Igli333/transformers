@@ -1040,18 +1040,54 @@ class MultiPolicyRouter(nn.Module):
             gates = torch.softmax(logits, dim=-1).gather(1, top1)
             return gates, top1
 
+
         elif self.policy == "adaptive":
-            # dynamic top-k threshold
-            # pick experts with prob > 1/num_experts
+            B, E = logits.size()
+            k = self.top_k  # chosen at inference → same for all tokens
             probs = torch.softmax(logits, dim=-1)
-            mask = probs > (1.0 / self.num_experts)
-            # fallback to top-1 if no expert qualifies
-            for_fallback = ~(mask.any(dim=-1, keepdim=True))
-            top1 = torch.argmax(probs, dim=-1, keepdim=True)
-            mask = mask | for_fallback
-            idx = mask.nonzero(as_tuple=False).reshape(logits.size(0), -1)[:, 1:]
-            gates = torch.gather(probs, 1, idx)
+            threshold = 1.0 / self.num_experts
+            mask = probs > threshold  # [B, E]
+
+            # detect rows with no experts passing threshold
+            none_selected = ~mask.any(dim=-1)  # [B]
+
+            # global top-k for fallback & padding
+            _, global_topk_idx = torch.topk(probs, k, dim=-1)  # [B, k]
+
+            idx_list = []
+            gate_list = []
+
+            for b in range(B):
+                selected = mask[b].nonzero(as_tuple=False).squeeze(-1)
+                if none_selected[b]:
+                    # fallback to top-k
+                    chosen = global_topk_idx[b]
+                else:
+                    if len(selected) > k:
+                        # too many → keep top-k among them
+                        sel_probs = probs[b, selected]
+                        _, local_top = torch.topk(sel_probs, k)
+                        chosen = selected[local_top]
+                    elif len(selected) < k:
+                        # too few → pad from highest remaining experts
+                        chosen = selected
+                        remaining_mask = torch.ones(E, dtype=torch.bool, device=probs.device)
+                        remaining_mask[selected] = False
+                        remaining = remaining_mask.nonzero(as_tuple=False).squeeze(-1)
+                        need = k - len(selected)
+                        _, extra_top = torch.topk(probs[b, remaining], need)
+                        chosen = torch.cat([chosen, remaining[extra_top]])
+                    else:
+                        # exactly k selected
+                        chosen = selected
+                idx_list.append(chosen)
+                gate_list.append(probs[b, chosen])
+
+            idx = torch.stack(idx_list, dim=0)  # [B, k]
+            gates = torch.stack(gate_list, dim=0)  # [B, k]
+
             return gates, idx
+
 
         else:
             raise ValueError(f"Unknown routing policy: {self.policy}")
@@ -1074,7 +1110,7 @@ class PhiMoESparseMoeBlock(nn.Module):
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size
         self.num_experts = config.num_local_experts
-        self.top_k = config.num_experts_per_tok
+        self.top_k = config.top_k
         global iterations
         iterations += 1
         self.iter = iterations
