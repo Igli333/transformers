@@ -1014,59 +1014,218 @@ class GraniteMoeHybridTopKGating(nn.Module):
         else:
             raise ValueError(f"Unknown routing policy: {self.policy}")
 
+    def _stable_hash(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Simple fast 32-bit mixing (murmur-like) for token IDs.
+        Returns a 32-bit integer tensor on same device.
+        """
+        x = x.to(torch.int64)
+        x = (x ^ (x >> 16)) & 0xFFFFFFFF
+        x = (x * 0x7feb352d) & 0xFFFFFFFF
+        x = (x ^ (x >> 15)) & 0xFFFFFFFF
+        x = (x * 0x846ca68b) & 0xFFFFFFFF
+        x = x ^ (x >> 16)
+        return x
+
     # -----------------------------
     # Implementations of policies
     # -----------------------------
-    def _top_k_routing(self, logits, hidden_states, k):
-        top_k_logits, top_k_indices = logits.topk(k, dim=1)
-        top_k_gates = torch.softmax(top_k_logits, dim=1).type_as(hidden_states)
-        zeros = torch.zeros([top_k_gates.size(0), self.num_experts], dtype=top_k_gates.dtype, device=top_k_gates.device)
-        gates = zeros.scatter(1, top_k_indices, 1)
-        expert_size = gates.long().sum(0).tolist()
+    def _top_k_routing(self, logits: torch.Tensor, hidden_states: torch.Tensor, k: int):
+        """
+        Returns:
+          index_sorted_experts: permutation indices into the flattened (B*k) arrays
+          batch_index: original batch indices (after permutation) length B*k
+          batch_gates: gate weights (after permutation) length B*k (type matches hidden_states)
+          expert_size: list of length num_experts with counts
+          logits: original logits (kept for convenience)
+        """
+        B, E = logits.size()
+        # top-k per sample
+        topk_vals, topk_idx = logits.topk(k, dim=1)  # [B, k]
+        topk_gates = torch.softmax(topk_vals, dim=1).type_as(hidden_states)  # [B, k]
 
-        top_k_experts = top_k_indices.flatten()
-        _, index_sorted_experts = top_k_experts.sort(0)
-        batch_index = index_sorted_experts.div(k, rounding_mode="trunc")
-        batch_gates = top_k_gates.flatten()[index_sorted_experts]
+        # flatten
+        flat_expert_indices = topk_idx.reshape(-1)  # [B*k]
+        flat_batch_indices = torch.arange(B, device=logits.device).repeat_interleave(k)  # [B*k]
+        flat_gates = topk_gates.reshape(-1)  # [B*k]
+
+        # permute so tokens are grouped by expert id (expert-major order)
+        perm = flat_expert_indices.argsort()  # indices into flattened arrays
+        index_sorted_experts = perm
+        batch_index = flat_batch_indices[perm]
+        batch_gates = flat_gates[perm]
+
+        # expert sizes: how many tokens assigned to each expert
+        expert_size = torch.bincount(flat_expert_indices, minlength=self.num_experts).to(torch.long).tolist()
 
         return index_sorted_experts, batch_index, batch_gates, expert_size, logits
 
-    def _noisy_top_k_routing(self, logits, hidden_states):
+    def _noisy_top_k_routing(self, logits: torch.Tensor, hidden_states: torch.Tensor):
         noise = torch.randn_like(logits) * 1e-2
         noisy_logits = logits + noise
         return self._top_k_routing(noisy_logits, hidden_states, k=self.top_k)
 
-    def _soft_routing(self, logits, hidden_states):
-        gates = torch.softmax(logits, dim=1).type_as(hidden_states)
-        expert_size = torch.ones(self.num_experts, dtype=torch.long, device=logits.device)  # placeholder
-        batch_index = torch.arange(logits.size(0), device=logits.device).repeat_interleave(self.num_experts)
-        index_sorted_experts = torch.arange(logits.size(0) * self.num_experts, device=logits.device)
-        batch_gates = gates.flatten()
-        return index_sorted_experts, batch_index, batch_gates, expert_size.tolist(), logits
+    def _soft_routing(self, logits: torch.Tensor, hidden_states: torch.Tensor):
+        """
+        Dense routing — every token goes to every expert.
+        We produce flattened arrays grouped by expert (expert-major), consistent with _top_k_routing output.
+        """
+        B, E = logits.size()
+        gates = torch.softmax(logits, dim=1).type_as(hidden_states)  # [B, E]
 
-    def _adaptive_routing(self, logits, hidden_states):
-        # Example: dynamic top-k per token based on max logit magnitude
-        top_k_dynamic = torch.clamp((torch.softmax(logits, dim=1).max(dim=1).values * self.num_experts).long(), min=1)
-        # For simplicity, fallback to top_k with max top_k_dynamic
-        return self._top_k_routing(logits, hidden_states, k=self.top_k)
+        # flatten in batch-major order first (token-major)
+        flat_gates = gates.reshape(-1)  # [B*E]
+
+        # flat_expert_indices: for each flattened position, which expert it refers to.
+        # For batch-major flattening top-level order is: for each b: [e0, e1, ..., eE-1]
+        # Therefore flat_expert_indices = [0..E-1, 0..E-1, ...] repeated B times
+        flat_expert_indices = torch.arange(E, device=logits.device).repeat(B)  # [B*E]
+
+        # flat_batch_indices: which batch each flattened entry comes from
+        flat_batch_indices = torch.arange(B, device=logits.device).repeat_interleave(E)  # [B*E]
+
+        # permute to group by expert id (expert-major)
+        perm = flat_expert_indices.argsort()
+        index_sorted_experts = perm
+        batch_index = flat_batch_indices[perm]
+        batch_gates = flat_gates[perm]
+
+        expert_size = torch.full((E,), B, dtype=torch.long, device=logits.device).tolist()
+
+        return index_sorted_experts, batch_index, batch_gates, expert_size, logits
+
+    def _adaptive_routing(self, logits: torch.Tensor, hidden_states: torch.Tensor):
+        """
+        Adaptive threshold-based selection, but **always** returns exactly self.top_k per token
+        (pads/truncates as needed). Output format matches _top_k_routing.
+        """
+        B, E = logits.size()
+        k = self.top_k
+
+        probs = torch.softmax(logits, dim=-1)  # [B, E]
+        threshold = 1.0 / float(self.num_experts)
+        mask = probs > threshold  # [B, E]
+
+        # global top-k for fallback/padding
+        _, global_topk_idx = torch.topk(probs, k, dim=-1)  # [B, k]
+
+        # build per-sample selected indices (exactly k)
+        chosen_idx = torch.zeros((B, k), dtype=torch.long, device=logits.device)
+        chosen_gates = torch.zeros((B, k), dtype=probs.dtype, device=logits.device)
+
+        for b in range(B):
+            selected = mask[b].nonzero(as_tuple=False).squeeze(-1)
+            if selected.numel() == 0:
+                chosen = global_topk_idx[b]
+            else:
+                if selected.numel() > k:
+                    sel_probs = probs[b, selected]
+                    _, local_top = torch.topk(sel_probs, k)
+                    chosen = selected[local_top]
+                elif selected.numel() < k:
+                    # pad with highest remaining experts
+                    picked = selected.tolist() if selected.numel() > 0 else []
+                    need = k - len(picked)
+                    # remaining indices
+                    remaining_mask = torch.ones(E, dtype=torch.bool, device=logits.device)
+                    if len(picked) > 0:
+                        remaining_mask[selected] = False
+                    remaining = remaining_mask.nonzero(as_tuple=False).squeeze(-1)
+                    if remaining.numel() == 0:
+                        padding = torch.zeros(need, dtype=torch.long, device=logits.device)
+                    else:
+                        _, extra_top = torch.topk(probs[b, remaining], need)
+                        padding = remaining[extra_top]
+                    if isinstance(picked, list):
+                        chosen = torch.cat([torch.tensor(picked, device=logits.device, dtype=torch.long), padding])
+                    else:
+                        chosen = torch.cat([picked, padding])
+                else:
+                    chosen = selected
+            # ensure exactly k (safety)
+            if chosen.numel() != k:
+                chosen = global_topk_idx[b]
+
+            chosen_idx[b] = chosen
+            chosen_gates[b] = probs[b, chosen]
+
+        # now reuse top-k flattening/grouping logic
+        flat_expert_indices = chosen_idx.reshape(-1)  # [B*k]
+        flat_batch_indices = torch.arange(B, device=logits.device).repeat_interleave(k)  # [B*k]
+        flat_gates = chosen_gates.reshape(-1)
+
+        perm = flat_expert_indices.argsort()
+        index_sorted_experts = perm
+        batch_index = flat_batch_indices[perm]
+        batch_gates = flat_gates[perm]
+        expert_size = torch.bincount(flat_expert_indices, minlength=self.num_experts).to(torch.long).tolist()
+
+        return index_sorted_experts, batch_index, batch_gates, expert_size, logits
 
     def _load_balanced_routing(self, logits, hidden_states):
-        # Add regularization term in loss outside of routing
-        return self._top_k_routing(logits, hidden_states, k=self.top_k)
+        # top-k routing
+        index_sorted_experts, batch_index, batch_gates, expert_size, logits_out = \
+            self._top_k_routing(logits, hidden_states, k=self.top_k)
 
-    def _hash_routing(self, hidden_states):
-        # Deterministic mapping: e.g., use token ID modulo num_experts
-        token_ids = torch.arange(hidden_states.size(0), device=hidden_states.device)
-        top_1_indices = token_ids % self.num_experts
-        top_1_gates = torch.ones_like(top_1_indices, dtype=hidden_states.dtype)
-        expert_size = torch.ones(self.num_experts, dtype=torch.long).tolist()
-        batch_index = torch.arange(hidden_states.size(0), device=hidden_states.device)
-        index_sorted_experts = torch.arange(hidden_states.size(0), device=hidden_states.device)
-        return index_sorted_experts, batch_index, top_1_gates, expert_size, None
+        # compute GShard-style load balancing loss
+        probs = torch.softmax(logits, dim=-1)  # [B, E]
+        importance = probs.mean(dim=0)  # expected importance per expert
+        load = torch.tensor(expert_size, device=logits.device, dtype=probs.dtype) / logits.size(0)
+        aux_loss = (importance * load).sum() * self.load_balance_coef  # coef is a small scalar like 0.01
+
+        return index_sorted_experts, batch_index, batch_gates, expert_size, aux_loss
+
+    def _hash_routing(self, logits: torch.Tensor, hidden_states: torch.Tensor, input_ids: torch.Tensor = None):
+        """
+        Hash routing based on token ids. Requires input_ids argument (shape [B] or [B, seq_len] collapsed).
+        Returns the same data format as _top_k_routing.
+        """
+        if input_ids is None:
+            raise ValueError("input_ids must be provided for hash routing")
+
+        # flatten input ids to 1-D sequence corresponding to logits rows
+        # (assume logits rows correspond to tokens in the same order as input_ids)
+        token_ids = input_ids.reshape(-1).to(device=logits.device)
+
+        B = token_ids.size(0)
+        E = self.num_experts
+
+        hashed = (self._stable_hash(token_ids) % E).to(torch.long)  # [B]
+        # optional tiny jitter to improve load balance (uncomment if needed)
+        # if getattr(self, "jitter", 0.0) > 0:
+        #     noise = torch.randint(0, E, hashed.shape, device=hashed.device)
+        #     hashed = (hashed + noise) % E
+
+        flat_expert_indices = hashed  # [B]
+        flat_batch_indices = torch.arange(B, device=logits.device)  # [B]
+        flat_gates = torch.ones(B, dtype=hidden_states.dtype, device=logits.device)
+
+        perm = flat_expert_indices.argsort()
+        index_sorted_experts = perm
+        batch_index = flat_batch_indices[perm]
+        batch_gates = flat_gates[perm]
+        expert_size = torch.bincount(flat_expert_indices, minlength=E).to(torch.long).tolist()
+
+        return index_sorted_experts, batch_index, batch_gates, expert_size, None
 
     def _token_based_routing(self, logits, hidden_states):
-        # Switch-style: top-1 token-level routing
-        return self._top_k_routing(logits, hidden_states, k=1)
+        # Switch-style: top-1 token routing using softmax over all logits
+        top1_idx = torch.argmax(logits, dim=-1, keepdim=True)  # [B,1]
+        gates = torch.softmax(logits, dim=-1).gather(1, top1_idx)  # [B,1]
+
+        B = logits.size(0)
+        flat_expert_indices = top1_idx.reshape(-1)  # [B]
+        flat_batch_indices = torch.arange(B, device=logits.device)  # [B]
+        flat_gates = gates.reshape(-1)
+
+        # sort/group by expert
+        perm = flat_expert_indices.argsort()
+        index_sorted_experts = perm
+        batch_index = flat_batch_indices[perm]
+        batch_gates = flat_gates[perm]
+        expert_size = torch.bincount(flat_expert_indices, minlength=self.num_experts).tolist()
+
+        return index_sorted_experts, batch_index, batch_gates, expert_size, logits
 
 
 class GraniteMoeHybridMoE(nn.Module):

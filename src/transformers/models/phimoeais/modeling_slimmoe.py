@@ -996,7 +996,7 @@ class MultiPolicyRouter(nn.Module):
         self.policy = policy
         self.jitter = jitter
 
-    def forward(self, logits, training=True):
+    def forward(self, logits, training=True, input_ids=None):
         """
         Returns:
            gates: [tokens, k or num_experts]
@@ -1087,10 +1087,32 @@ class MultiPolicyRouter(nn.Module):
             gates = torch.stack(gate_list, dim=0)  # [B, k]
 
             return gates, idx
+        elif self.policy == "load_balance":
+            # simply perform top-k gating but ALSO compute aux loss
+            topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)
+            gates = torch.softmax(topk_vals, dim=-1)
 
+            aux_loss = self.compute_load_balancing_loss(logits, topk_idx)
+
+            return gates, topk_idx, aux_loss
 
         else:
             raise ValueError(f"Unknown routing policy: {self.policy}")
+
+    def compute_load_balancing_loss(self, logits, idx):
+        B, E = logits.size()
+        k = idx.size(1)
+
+        probs = torch.softmax(logits, dim=-1)  # [B, E]
+        importance = probs.mean(dim=0)  # [E]
+
+        load = torch.zeros(E, device=logits.device)
+        for e in range(E):
+            load[e] = (idx == e).float().sum() / (B * k)
+
+        aux_loss = (importance * load).sum() * E
+
+        return self.load_balance_coef * aux_loss
 
 
 class PhiMoESparseMoeBlock(nn.Module):
