@@ -1095,12 +1095,10 @@ class GraniteMoeHybridTopKGating(nn.Module):
         return index_sorted_experts, batch_index, batch_gates, expert_size, logits
 
     def _adaptive_routing(self, logits: torch.Tensor, hidden_states: torch.Tensor):
-        """
-        Adaptive threshold-based selection, but **always** returns exactly self.top_k per token
-        (pads/truncates as needed). Output format matches _top_k_routing.
-        """
         B, E = logits.size()
         k = self.top_k
+        device = logits.device
+        dtype = logits.dtype  # keep dtype consistent with logits
 
         probs = torch.softmax(logits, dim=-1)  # [B, E]
         threshold = 1.0 / float(self.num_experts)
@@ -1109,49 +1107,46 @@ class GraniteMoeHybridTopKGating(nn.Module):
         # global top-k for fallback/padding
         _, global_topk_idx = torch.topk(probs, k, dim=-1)  # [B, k]
 
-        # build per-sample selected indices (exactly k)
-        chosen_idx = torch.zeros((B, k), dtype=torch.long, device=logits.device)
-        chosen_gates = torch.zeros((B, k), dtype=probs.dtype, device=logits.device)
+        # prepare output tensors
+        chosen_idx = torch.zeros((B, k), dtype=torch.long, device=device)
+        chosen_gates = torch.zeros((B, k), dtype=dtype, device=device)
 
         for b in range(B):
-            selected = mask[b].nonzero(as_tuple=False).squeeze(-1)
-            if selected.numel() == 0:
+            selected = mask[b].nonzero(as_tuple=False).squeeze(-1)  # indices above threshold
+
+            num_selected = selected.numel()
+
+            if num_selected == 0:
                 chosen = global_topk_idx[b]
+            elif num_selected >= k:
+                # pick top-k among selected
+                sel_probs = probs[b, selected]
+                _, top_sel = torch.topk(sel_probs, k)
+                chosen = selected[top_sel]
             else:
-                if selected.numel() > k:
-                    sel_probs = probs[b, selected]
-                    _, local_top = torch.topk(sel_probs, k)
-                    chosen = selected[local_top]
-                elif selected.numel() < k:
-                    # pad with highest remaining experts
-                    picked = selected.tolist() if selected.numel() > 0 else []
-                    need = k - len(picked)
-                    # remaining indices
-                    remaining_mask = torch.ones(E, dtype=torch.bool, device=logits.device)
-                    if len(picked) > 0:
-                        remaining_mask[selected] = False
-                    remaining = remaining_mask.nonzero(as_tuple=False).squeeze(-1)
-                    if remaining.numel() == 0:
-                        padding = torch.zeros(need, dtype=torch.long, device=logits.device)
-                    else:
-                        _, extra_top = torch.topk(probs[b, remaining], need)
-                        padding = remaining[extra_top]
-                    if isinstance(picked, list):
-                        chosen = torch.cat([torch.tensor(picked, device=logits.device, dtype=torch.long), padding])
-                    else:
-                        chosen = torch.cat([picked, padding])
+                # fewer than k selected → pad with remaining top probabilities
+                picked = selected
+                need = k - num_selected
+                remaining_mask = torch.ones(E, dtype=torch.bool, device=device)
+                remaining_mask[selected] = False
+                remaining = remaining_mask.nonzero(as_tuple=False).squeeze(-1)
+                if remaining.numel() > 0:
+                    _, extra_top = torch.topk(probs[b, remaining], need)
+                    padding = remaining[extra_top]
                 else:
-                    chosen = selected
-            # ensure exactly k (safety)
+                    padding = torch.zeros(need, dtype=torch.long, device=device)
+                chosen = torch.cat([picked, padding])
+
+            # safety: ensure exactly k
             if chosen.numel() != k:
                 chosen = global_topk_idx[b]
 
             chosen_idx[b] = chosen
             chosen_gates[b] = probs[b, chosen]
 
-        # now reuse top-k flattening/grouping logic
+        # flatten for top-k logic
         flat_expert_indices = chosen_idx.reshape(-1)  # [B*k]
-        flat_batch_indices = torch.arange(B, device=logits.device).repeat_interleave(k)  # [B*k]
+        flat_batch_indices = torch.arange(B, device=device).repeat_interleave(k)  # [B*k]
         flat_gates = chosen_gates.reshape(-1)
 
         perm = flat_expert_indices.argsort()
