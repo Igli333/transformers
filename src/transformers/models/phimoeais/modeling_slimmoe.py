@@ -1024,8 +1024,10 @@ class MultiPolicyRouter(nn.Module):
 
         elif self.policy == "soft":
             # dense mixture: every expert used
-            gates = torch.softmax(logits, dim=-1)
-            idx = torch.arange(self.num_experts, device=logits.device)[None, :].expand_as(gates)
+            B, E = logits.size()
+            scaled_logits = logits / 0.5
+            gates = torch.softmax(scaled_logits, dim=-1)  # [B, E], sum=1 per token
+            idx = torch.arange(E, device=logits.device).unsqueeze(0).expand(B, -1)  # [B, E]
             return gates, idx
 
         elif self.policy == "hash":
