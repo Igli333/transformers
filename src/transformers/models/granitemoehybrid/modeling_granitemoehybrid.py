@@ -1095,16 +1095,22 @@ class GraniteMoeHybridTopKGating(nn.Module):
         return index_sorted_experts, batch_index, batch_gates, expert_size, logits
 
     def _adaptive_routing(self, logits: torch.Tensor, hidden_states: torch.Tensor):
+        """
+        Adaptive threshold-based selection, always returns exactly self.top_k per token.
+        Fully mixed-precision safe.
+        """
         B, E = logits.size()
         k = self.top_k
         device = logits.device
         dtype = logits.dtype  # keep dtype consistent with logits
 
-        probs = torch.softmax(logits, dim=-1)  # [B, E]
+        # softmax probabilities in the same dtype as logits
+        probs = torch.softmax(logits, dim=-1).to(dtype)  # [B, E]
+
         threshold = 1.0 / float(self.num_experts)
         mask = probs > threshold  # [B, E]
 
-        # global top-k for fallback/padding
+        # global top-k fallback
         _, global_topk_idx = torch.topk(probs, k, dim=-1)  # [B, k]
 
         # prepare output tensors
@@ -1113,7 +1119,6 @@ class GraniteMoeHybridTopKGating(nn.Module):
 
         for b in range(B):
             selected = mask[b].nonzero(as_tuple=False).squeeze(-1)  # indices above threshold
-
             num_selected = selected.numel()
 
             if num_selected == 0:
@@ -1127,17 +1132,22 @@ class GraniteMoeHybridTopKGating(nn.Module):
                 # fewer than k selected → pad with remaining top probabilities
                 picked = selected
                 need = k - num_selected
+
+                # remaining indices
                 remaining_mask = torch.ones(E, dtype=torch.bool, device=device)
-                remaining_mask[selected] = False
+                remaining_mask[picked] = False
                 remaining = remaining_mask.nonzero(as_tuple=False).squeeze(-1)
+
                 if remaining.numel() > 0:
                     _, extra_top = torch.topk(probs[b, remaining], need)
                     padding = remaining[extra_top]
                 else:
                     padding = torch.zeros(need, dtype=torch.long, device=device)
+
+                # concatenate picked + padding
                 chosen = torch.cat([picked, padding])
 
-            # safety: ensure exactly k
+            # safety check: ensure exactly k
             if chosen.numel() != k:
                 chosen = global_topk_idx[b]
 
@@ -1154,6 +1164,9 @@ class GraniteMoeHybridTopKGating(nn.Module):
         batch_index = flat_batch_indices[perm]
         batch_gates = flat_gates[perm]
         expert_size = torch.bincount(flat_expert_indices, minlength=self.num_experts).to(torch.long).tolist()
+
+        # ensure logits are same dtype as model to avoid Conv1d type errors
+        logits = logits.to(dtype)
 
         return index_sorted_experts, batch_index, batch_gates, expert_size, logits
 
