@@ -1055,7 +1055,7 @@ class MultiPolicyRouter(nn.Module):
             none_selected = ~mask.any(dim=-1)  # [B]
 
             # global top-k fallback
-            _, global_topk_idx = torch.topk(probs, top_k, dim=-1)  # [B, k]
+            _, global_topk_idx = torch.topk(probs, self.top_k, dim=-1)  # [B, k]
 
             # number of selected per row
             num_selected = mask.sum(dim=-1)  # [B]
@@ -1070,7 +1070,7 @@ class MultiPolicyRouter(nn.Module):
                 # get masked probs
                 masked_probs = probs.clone()
                 masked_probs[~mask] = -1  # exclude masked experts
-                topk_masked_probs, topk_idx_masked = torch.topk(masked_probs, top_k, dim=-1)
+                topk_masked_probs, topk_idx_masked = torch.topk(masked_probs, self.top_k, dim=-1)
                 # only update rows with actual selections
                 idx[has_selection] = topk_idx_masked[has_selection]
 
