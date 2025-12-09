@@ -1031,8 +1031,9 @@ class MultiPolicyRouter(nn.Module):
         elif self.policy == "hash":
             # static (non-learned) hash assignment
             tok_ids = torch.arange(logits.size(0), device=logits.device)
-            idx = (tok_ids % self.num_experts).unsqueeze(-1)
+            idx = torch.stack([ (tok_ids + i) % self.num_experts for i in range(self.top_k) ], dim=-1)  # [B, top_k]
             gates = torch.ones_like(idx, dtype=logits.dtype)
+            gates = gates / gates.sum(dim=-1, keepdim=True)
             return gates, idx
 
         elif self.policy == "switch":
