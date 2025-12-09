@@ -1038,9 +1038,24 @@ class MultiPolicyRouter(nn.Module):
 
         elif self.policy == "switch":
             # Switch Transformer: top-1 but with stability
-            top1 = torch.argmax(logits, dim=-1, keepdim=True)
-            gates = torch.softmax(logits, dim=-1).gather(1, top1)
-            return gates, top1
+            B, E = logits.size()
+
+            # Temperature scaling for numerical stability
+            scaled_logits = logits / 0.5
+
+            # Softmax probabilities per token
+            probs = torch.softmax(scaled_logits, dim=-1)  # [B, E]
+
+            # Top-k expert indices per token
+            topk_vals, topk_idx = torch.topk(probs, self.top_k, dim=-1)  # [B, top_k]
+
+            # Gather corresponding probabilities as gates
+            gates = probs.gather(dim=-1, index=topk_idx)  # [B, top_k]
+
+            # Normalize gates so they sum to 1 per token
+            gates = gates / gates.sum(dim=-1, keepdim=True)
+
+            return gates, topk_idx
 
 
         elif self.policy == "adaptive":
