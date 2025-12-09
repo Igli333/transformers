@@ -1044,48 +1044,41 @@ class MultiPolicyRouter(nn.Module):
 
         elif self.policy == "adaptive":
             B, E = logits.size()
-            k = self.top_k  # chosen at inference → same for all tokens
             probs = torch.softmax(logits, dim=-1)
-            threshold = 1.0 / self.num_experts
+
+            threshold = 1.0 / E
+
+            # mask of experts passing threshold
             mask = probs > threshold  # [B, E]
 
-            # detect rows with no experts passing threshold
+            # rows with no experts passing threshold
             none_selected = ~mask.any(dim=-1)  # [B]
 
-            # global top-k for fallback & padding
-            _, global_topk_idx = torch.topk(probs, k, dim=-1)  # [B, k]
+            # global top-k fallback
+            _, global_topk_idx = torch.topk(probs, top_k, dim=-1)  # [B, k]
 
-            idx_list = []
-            gate_list = []
+            # number of selected per row
+            num_selected = mask.sum(dim=-1)  # [B]
 
-            for b in range(B):
-                selected = mask[b].nonzero(as_tuple=False).squeeze(-1)
-                if none_selected[b]:
-                    # fallback to top-k
-                    chosen = global_topk_idx[b]
-                else:
-                    if len(selected) > k:
-                        # too many → keep top-k among them
-                        sel_probs = probs[b, selected]
-                        _, local_top = torch.topk(sel_probs, k)
-                        chosen = selected[local_top]
-                    elif len(selected) < k:
-                        # too few → pad from highest remaining experts
-                        chosen = selected
-                        remaining_mask = torch.ones(E, dtype=torch.bool, device=probs.device)
-                        remaining_mask[selected] = False
-                        remaining = remaining_mask.nonzero(as_tuple=False).squeeze(-1)
-                        need = k - len(selected)
-                        _, extra_top = torch.topk(probs[b, remaining], need)
-                        chosen = torch.cat([chosen, remaining[extra_top]])
-                    else:
-                        # exactly k selected
-                        chosen = selected
-                idx_list.append(chosen)
-                gate_list.append(probs[b, chosen])
+            # select candidates for each row
+            # initialize idx tensor with fallback top-k
+            idx = global_topk_idx.clone()  # [B, k]
 
-            idx = torch.stack(idx_list, dim=0)  # [B, k]
-            gates = torch.stack(gate_list, dim=0)  # [B, k]
+            # For rows with at least one selected expert, replace top-k
+            has_selection = ~none_selected
+            if has_selection.any():
+                # get masked probs
+                masked_probs = probs.clone()
+                masked_probs[~mask] = -1  # exclude masked experts
+                topk_masked_probs, topk_idx_masked = torch.topk(masked_probs, top_k, dim=-1)
+                # only update rows with actual selections
+                idx[has_selection] = topk_idx_masked[has_selection]
+
+            # get corresponding gates
+            gates = probs.gather(dim=-1, index=idx)  # [B, k]
+
+            # normalize gates per row
+            gates = gates / gates.sum(dim=-1, keepdim=True)
 
             return gates, idx
         elif self.policy == "load_balance":
