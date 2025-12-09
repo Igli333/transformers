@@ -989,12 +989,13 @@ iterations = 0
 
 
 class MultiPolicyRouter(nn.Module):
-    def __init__(self, num_experts, top_k, policy="top_k", jitter=0.0):
+    def __init__(self, num_experts, top_k, policy="top_k", jitter=0.0, load_balance_coef=0.01):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
         self.policy = policy
         self.jitter = jitter
+        self.load_balance_coef = load_balance_coef
 
     def forward(self, logits, training=True, input_ids=None):
         """
@@ -1144,6 +1145,7 @@ class PhiMoESparseMoeBlock(nn.Module):
             top_k=self.top_k,
             policy=config.routing_policy,
             jitter=config.router_jitter_noise,
+            load_balance_coef=config.load_balance_coef
         )
 
         self.experts = nn.ModuleList([PhiMoEBlockSparseTop2MLP(config) for _ in range(self.num_experts)])

@@ -1008,7 +1008,7 @@ class GraniteMoeHybridTopKGating(nn.Module):
         elif self.policy == "load_balanced":
             return self._load_balanced_routing(logits, hidden_states)
         elif self.policy == "hash":
-            return self._hash_routing(hidden_states)
+            return self._hash_routing(logits, hidden_states)
         elif self.policy == "token_based":
             return self._token_based_routing(logits, hidden_states)
         else:

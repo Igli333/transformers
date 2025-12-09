@@ -141,6 +141,7 @@ class PhiMoEConfig(PretrainedConfig):
             router_aux_loss_coef=0.001,
             router_jitter_noise=0.01,
             input_jitter_noise=0.0,
+            load_balance_coef=0.01,
             attention_bias=False,
             lm_head_bias=False,
             routing_policy="top_k",
@@ -178,6 +179,7 @@ class PhiMoEConfig(PretrainedConfig):
         self.router_jitter_noise = router_jitter_noise
         self.input_jitter_noise = input_jitter_noise
         self.routing_policy = routing_policy
+        self.load_balance_coef = load_balance_coef
 
         self.rope_scaling = rope_scaling
         self._rope_scaling_validation()
