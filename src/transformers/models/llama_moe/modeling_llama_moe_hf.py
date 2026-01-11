@@ -593,7 +593,6 @@ class TopKBalancedNoisyGate(nn.Module):
         logits_noise = None
         noise_control = None
 
-        # Only used for noisy top-k
         if self.training and self.add_noise and self.routing_policy == "topk_noisy":
             noise_mm = self.weight_noise(x)
             noise_control = self.softplus(noise_mm) + self.noise_epsilon
