@@ -45,7 +45,6 @@ class LlamaMoEConfig(PretrainedConfig):
     ):
         super().__init__(**kwargs)
 
-        # Standard LLaMA params
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
