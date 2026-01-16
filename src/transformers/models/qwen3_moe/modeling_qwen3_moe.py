@@ -33,9 +33,9 @@ from ...integrations import use_kernel_forward_from_hub
 from ...masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_layers import (
-    GenericForQuestionAnswering,
-    GenericForSequenceClassification,
-    GenericForTokenClassification,
+    # GenericForQuestionAnswering,
+    # GenericForSequenceClassification,
+    # GenericForTokenClassification,
     GradientCheckpointingLayer,
 )
 from ...modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
@@ -715,17 +715,17 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
         )
 
 
-class Qwen3MoeForSequenceClassification(GenericForSequenceClassification, Qwen3MoePreTrainedModel):
-    pass
-
-
-class Qwen3MoeForTokenClassification(GenericForTokenClassification, Qwen3MoePreTrainedModel):
-    pass
-
-
-class Qwen3MoeForQuestionAnswering(GenericForQuestionAnswering, Qwen3MoePreTrainedModel):
-    base_model_prefix = "transformer"  # For BC, where `transformer` was used instead of `model`
-
+# class Qwen3MoeForSequenceClassification(GenericForSequenceClassification, Qwen3MoePreTrainedModel):
+#     pass
+#
+#
+# class Qwen3MoeForTokenClassification(GenericForTokenClassification, Qwen3MoePreTrainedModel):
+#     pass
+#
+#
+# class Qwen3MoeForQuestionAnswering(GenericForQuestionAnswering, Qwen3MoePreTrainedModel):
+#     base_model_prefix = "transformer"  # For BC, where `transformer` was used instead of `model`
+#
 
 __all__ = [
     "Qwen3MoeForCausalLM",
