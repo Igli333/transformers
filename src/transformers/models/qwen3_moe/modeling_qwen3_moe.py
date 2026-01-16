@@ -26,7 +26,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ... import initialization as init
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
@@ -377,10 +376,10 @@ class Qwen3MoePreTrainedModel(PreTrainedModel):
         super()._init_weights(module)
         std = self.config.initializer_range
         if isinstance(module, Qwen3MoeExperts):
-            init.normal_(module.gate_up_proj, mean=0.0, std=std)
-            init.normal_(module.down_proj, mean=0.0, std=std)
+            nn.init.normal_(module.gate_up_proj, mean=0.0, std=std)
+            nn.init.normal_(module.down_proj, mean=0.0, std=std)
         elif isinstance(module, Qwen3MoeTopKRouter):
-            init.normal_(module.weight, mean=0.0, std=std)
+            nn.init.normal_(module.weight, mean=0.0, std=std)
 
 
 class Qwen3MoeRotaryEmbedding(nn.Module):
