@@ -27,32 +27,36 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 
-from ...activations import ACT2FN
-from ...cache_utils import Cache, DynamicCache, SlidingWindowCache, StaticCache
-from ...generation import GenerationMixin
-from ...modeling_attn_mask_utils import AttentionMaskConverter
-from ...modeling_flash_attention_utils import flash_attn_supports_top_left_mask, is_flash_attn_available
-from ...modeling_layers import GradientCheckpointingLayer
-from ...modeling_outputs import (
-    MoeCausalLMOutputWithPast,
-    MoeModelOutputWithPast,
-    QuestionAnsweringModelOutput,
-    SequenceClassifierOutputWithPast,
-    TokenClassifierOutput,
+
+
+from transformers.generation import GenerationMixin
+from transformers.integrations import use_kernel_forward_from_hub
+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+from transformers.modeling_layers import (
+    GenericForQuestionAnswering,
+    GenericForSequenceClassification,
+    GenericForTokenClassification,
+    GradientCheckpointingLayer,
 )
-from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from ...modeling_utils import PreTrainedModel
-from ...utils import auto_docstring, can_return_tuple, is_torch_flex_attn_available, logging
+
+from transformers.modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast, QuestionAnsweringModelOutput, SequenceClassifierOutput, SequenceClassifierOutputWithPast, TokenClassifierOutput
+from transformers.processing_utils import Unpack
+
+from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+from transformers.modeling_utils import PreTrainedModel
+from transformers.utils import auto_docstring, can_return_tuple, is_flash_attn_2_available, is_torch_flex_attn_available, logging
 from .configuration_qwen2_moe import Qwen2MoeConfig
 
 
-if is_flash_attn_available():
-    from ...modeling_flash_attention_utils import _flash_attention_forward
+if is_flash_attn_2_available():
+    from transformers.modeling_flash_attention_utils import _flash_attention_forward
 
 if is_torch_flex_attn_available():
     from torch.nn.attention.flex_attention import BlockMask
 
-    from ...integrations.flex_attention import make_flex_block_causal_mask
+    from transformers.integrations.flex_attention import make_flex_block_causal_mask
 
 logger = logging.get_logger(__name__)
 
