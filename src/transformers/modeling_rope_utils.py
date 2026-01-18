@@ -607,11 +607,29 @@ def _compute_llama3_parameters(
 
     return inv_freq_llama, attention_factor
 
+def _compute_default_rope_parameters(
+    config: Optional[PreTrainedConfig] = None,
+    device: Optional["torch.device"] = None,
+    seq_len: Optional[int] = None,
+    layer_type: Optional[str] = None,
+) -> tuple["torch.Tensor", float]:
+    standardize_rope_params(config)
+    rope_parameters_dict = config.rope_parameters[layer_type] if layer_type is not None else config.rope_parameters
+
+    base = rope_parameters_dict.get("rope_theta", getattr(config, "rope_theta", 10000.0))
+    partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+    head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    dim = int(head_dim * partial_rotary_factor)
+
+    attention_factor = 1.0
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim))
+    return inv_freq, attention_factor
 
 # This maps the "rope_type" string field in rope config to the corresponding function to compute the RoPE parameters
 # from the model config. You can append new {'rope_type': callable} pairs to this rope_parameters to enable custom RoPE
 # parameterizations, as long as the callable has the same signature.
 ROPE_INIT_FUNCTIONS = {
+    "default": _compute_default_rope_parameters,
     "linear": _compute_linear_scaling_rope_parameters,
     "dynamic": _compute_dynamic_ntk_parameters,
     "yarn": _compute_yarn_parameters,
@@ -845,7 +863,7 @@ def _validate_llama3_parameters(rope_parameters: dict, config: PreTrainedConfig,
 
 # Like `ROPE_INIT_FUNCTIONS`, this validation function mapping can be dynamically updated for custom RoPE types.
 ROPE_VALIDATION_FUNCTIONS = {
-    "default": _validate_default_rope_parameters,
+    "default": _compute_default_rope_parameters,
     "linear": _validate_linear_scaling_rope_parameters,
     "dynamic": _validate_dynamic_scaling_rope_parameters,
     "yarn": _validate_yarn_parameters,
