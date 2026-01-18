@@ -13,7 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Qwen3MoE model configuration"""
 
 from typing import Optional
 
@@ -27,20 +26,18 @@ logger = logging.get_logger(__name__)
 
 class Qwen2MoeConfig(PreTrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`Qwen3MoeModel`].
-    ...
+    Configuration class for Qwen2MoE-style models.
 
-    MoE Router Policy (NEW):
+    Notes (practical, since transformers loves landmines):
+    - We MUST consume (pop) rope_theta/rope_scaling from kwargs or they may leak into PreTrainedConfig and crash.
+    - We MUST define layer_types before calling standardize_rope_params(), because it may expand rope params per layer type.
+    - We MUST ensure pad_token_id/bos_token_id/eos_token_id attributes exist, even if None, because downstream code accesses them.
+
+    MoE Router Policy (optional experimentation hook):
         routing_policy (`str`, *optional*, defaults to `"topk"`):
-            Routing strategy for selecting experts. Supported:
-            - `"topk"`: softmax then top-k (default)
-            - `"top1"` / `"switch"`: select 1 expert (repeated to K internally if needed)
-            - `"soft"`: softmax then top-k (same as topk, but kept for experimentation hooks)
-            - `"hash"`: deterministic hashing-based routing from hidden state sign pattern
-            - `"topk_noisy"`: adds Gaussian noise to router logits during training, then top-k
-
+            - "topk", "top1", "soft", "hash", "topk_noisy"
         router_noise_epsilon (`float`, *optional*, defaults to `1e-2`):
-            Stddev for Gaussian noise added to router logits in `"topk_noisy"` routing (training only).
+            noise stddev for "topk_noisy" (if you actually use it)
     """
 
     model_type = "qwen2_moe"
@@ -75,13 +72,15 @@ class Qwen2MoeConfig(PreTrainedConfig):
         hidden_act: Optional[str] = "silu",
         max_position_embeddings: Optional[int] = 32768,
         initializer_range: Optional[float] = 0.02,
-        rms_norm_eps: Optional[int] = 1e-6,
+        rms_norm_eps: Optional[float] = 1e-6,
         use_cache: Optional[bool] = True,
         tie_word_embeddings: Optional[bool] = False,
         rope_parameters: Optional[RopeParameters | dict[str, RopeParameters]] = None,
         attention_bias: Optional[bool] = False,
         use_sliding_window: Optional[bool] = False,
         sliding_window: Optional[int] = 4096,
+        max_window_layers: Optional[int] = 28,
+        layer_types: Optional[list[str]] = None,
         attention_dropout: Optional[float] = 0.0,
         decoder_sparse_step: Optional[int] = 1,
         moe_intermediate_size: Optional[int] = 768,
@@ -90,70 +89,79 @@ class Qwen2MoeConfig(PreTrainedConfig):
         norm_topk_prob: Optional[bool] = False,
         output_router_logits: Optional[bool] = False,
         router_aux_loss_coef: Optional[float] = 0.001,
-        mlp_only_layers: Optional[bool] = None,
+        mlp_only_layers: Optional[list[int]] = None,
         routing_policy: Optional[str] = "topk",
         router_noise_epsilon: Optional[float] = 1e-2,
         **kwargs,
     ):
+      
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
-        self.use_sliding_window = use_sliding_window
-        self.sliding_window = sliding_window if use_sliding_window else None
-
         self.num_key_value_heads = num_key_value_heads
         self.hidden_act = hidden_act
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
+
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
 
-        # Try to set `rope_scaling` if available, otherwise use `rope_parameters`
-        rope_scaling = kwargs.pop("rope_scaling", None)
-        self.rope_parameters = rope_scaling or rope_parameters
+        self.use_sliding_window = bool(use_sliding_window)
+        self.sliding_window = int(sliding_window) if self.use_sliding_window else 0
+        self.max_window_layers = int(max_window_layers) if max_window_layers is not None else 28
 
-        # Validate RoPE params
-        rope_theta = kwargs.get("rope_theta", 10000.0)
-        standardize_rope_params(self, rope_theta=rope_theta)
-        rope_config_validation(self)
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention"
+                if (self.use_sliding_window and i < self.max_window_layers and ((i + 1) % 2 == 1))
+                else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
 
-        # MoE arguments
-        self.decoder_sparse_step = decoder_sparse_step
-        self.moe_intermediate_size = moe_intermediate_size
-        self.num_experts_per_tok = num_experts_per_tok
-        self.num_experts = num_experts
-        self.norm_topk_prob = norm_topk_prob
-        self.output_router_logits = output_router_logits
-        self.router_aux_loss_coef = router_aux_loss_coef
-        self.mlp_only_layers = [] if mlp_only_layers is None else mlp_only_layers
-       
-        self.routing_policy = routing_policy
-        self.router_noise_epsilon = router_noise_epsilon
-        # --- Standard special-token ids: must exist as attributes ---
-        # Some Qwen configs don't define pad_token_id in JSON, but code expects the attribute to exist.
-        bos_token_id = kwargs.pop("bos_token_id", 151643)
-        eos_token_id = kwargs.pop("eos_token_id", 151643)
-
-        # Prefer explicit pad_token_id if present, else fall back to tokenizer's pad later.
+        bos_token_id = kwargs.pop("bos_token_id", None)
+        eos_token_id = kwargs.pop("eos_token_id", None)
         pad_token_id = kwargs.pop("pad_token_id", None)
 
-        # Ensure attributes exist even if None
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
 
+        if self.pad_token_id is None and self.eos_token_id is not None:
+            self.pad_token_id = self.eos_token_id
+
+        self.rope_theta = float(kwargs.pop("rope_theta", 10000.0))
+
+        rope_scaling = kwargs.pop("rope_scaling", None)
+        self.rope_parameters = rope_scaling or rope_parameters
+
+        standardize_rope_params(self, rope_theta=self.rope_theta)
+        rope_config_validation(self)
+
+  
+        self.decoder_sparse_step = int(decoder_sparse_step)
+        self.moe_intermediate_size = int(moe_intermediate_size)
+        self.num_experts_per_tok = int(num_experts_per_tok)
+        self.num_experts = int(num_experts)
+        self.norm_topk_prob = bool(norm_topk_prob)
+        self.output_router_logits = bool(output_router_logits)
+        self.router_aux_loss_coef = float(router_aux_loss_coef)
+        self.mlp_only_layers = [] if mlp_only_layers is None else list(mlp_only_layers)
+
+        self.routing_policy = routing_policy
+        self.router_noise_epsilon = float(router_noise_epsilon)
+
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            pad_token_id=pad_token_id,
+            bos_token_id=self.bos_token_id,
+            eos_token_id=self.eos_token_id,
+            pad_token_id=self.pad_token_id,
             **kwargs,
         )
-
 
 
 __all__ = ["Qwen2MoeConfig"]
