@@ -27,32 +27,36 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 
-from ...activations import ACT2FN
-from ...cache_utils import Cache, DynamicCache, SlidingWindowCache, StaticCache
-from ...generation import GenerationMixin
-from ...modeling_attn_mask_utils import AttentionMaskConverter
-from ...modeling_flash_attention_utils import flash_attn_supports_top_left_mask, is_flash_attn_available
-from ...modeling_layers import GradientCheckpointingLayer
-from ...modeling_outputs import (
-    MoeCausalLMOutputWithPast,
-    MoeModelOutputWithPast,
-    QuestionAnsweringModelOutput,
-    SequenceClassifierOutputWithPast,
-    TokenClassifierOutput,
+
+
+from transformers.generation import GenerationMixin
+from transformers.integrations import use_kernel_forward_from_hub
+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+from transformers.modeling_layers import (
+    GenericForQuestionAnswering,
+    GenericForSequenceClassification,
+    GenericForTokenClassification,
+    GradientCheckpointingLayer,
 )
-from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from ...modeling_utils import PreTrainedModel
-from ...utils import auto_docstring, can_return_tuple, is_torch_flex_attn_available, logging
+
+from transformers.modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast, QuestionAnsweringModelOutput, SequenceClassifierOutput, SequenceClassifierOutputWithPast, TokenClassifierOutput
+from transformers.processing_utils import Unpack
+
+from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+from transformers.modeling_utils import PreTrainedModel
+from transformers.utils import auto_docstring, can_return_tuple, is_flash_attn_2_available, is_torch_flex_attn_available, logging
 from .configuration_qwen2_moe import Qwen2MoeConfig
 
 
-if is_flash_attn_available():
-    from ...modeling_flash_attention_utils import _flash_attention_forward
+if is_flash_attn_2_available():
+    from transformers.modeling_flash_attention_utils import _flash_attention_forward
 
 if is_torch_flex_attn_available():
     from torch.nn.attention.flex_attention import BlockMask
 
-    from ...integrations.flex_attention import make_flex_block_causal_mask
+    from transformers.integrations.flex_attention import make_flex_block_causal_mask
 
 logger = logging.get_logger(__name__)
 
@@ -162,38 +166,71 @@ class Qwen2MoeRMSNorm(nn.Module):
 
 
 # Copied from transformers.models.llama.modeling_llama.LlamaRotaryEmbedding with Llama->Qwen2Moe
+# Replace the entire Qwen2MoeRotaryEmbedding class with this version
+
 class Qwen2MoeRotaryEmbedding(nn.Module):
-    def __init__(self, config: Qwen2MoeConfig, device=None):
+    def __init__(self, config: Qwen2MoeConfig, device=None, layer_type: Optional[str] = None):
         super().__init__()
-        # BC: "rope_type" was originally "type"
-        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
-        else:
-            self.rope_type = "default"
+        self.config = config
+
+        # ---- Decide which rope_parameters dict we should use ----
+        rope_params = getattr(config, "rope_parameters", None)
+
+        # If rope_parameters is nested per layer_type, pick the right one.
+        # We default to "full_attention" if present, otherwise first available.
+        if isinstance(rope_params, dict) and getattr(config, "layer_types", None) is not None:
+            # nested form looks like {"full_attention": {...}, "sliding_attention": {...}}
+            if all(k in config.layer_types for k in rope_params.keys()):
+                if layer_type is None:
+                    if "full_attention" in rope_params:
+                        rope_params = rope_params["full_attention"]
+                    else:
+                        rope_params = rope_params[next(iter(rope_params.keys()))]
+                else:
+                    rope_params = rope_params.get(layer_type, rope_params.get("full_attention", next(iter(rope_params.values()))))
+
+        # rope_params should now be a single dict or None
+        rope_type = None
+        if isinstance(rope_params, dict):
+            rope_type = rope_params.get("rope_type", rope_params.get("type", None))
+
+        if rope_type is None:
+            rope_scaling = getattr(config, "rope_scaling", None)
+            if isinstance(rope_scaling, dict):
+                rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", None))
+
+        self.rope_type = rope_type or "default"
+
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
 
-        self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        if self.rope_type not in ROPE_INIT_FUNCTIONS:
+            raise KeyError(
+                f"rope_type='{self.rope_type}' not in ROPE_INIT_FUNCTIONS. "
+                f"Available: {sorted(ROPE_INIT_FUNCTIONS.keys())}. "
+                f"Fix modeling_rope_utils.py to include this mapping."
+            )
 
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
 
     @torch.no_grad()
-    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
+    @dynamic_rope_update
     def forward(self, x, position_ids):
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
 
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
+        with torch.autocast(device_type=device_type, enabled=False):
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
 
 
 # Copied from transformers.models.llama.modeling_llama.rotate_half
