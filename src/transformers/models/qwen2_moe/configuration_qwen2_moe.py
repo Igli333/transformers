@@ -16,7 +16,7 @@
 
 from typing import Optional
 
-from transformers.configuration_utils import PreTrainedConfig
+from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import RopeParameters, rope_config_validation, standardize_rope_params
 from transformers.utils import logging
 
@@ -24,7 +24,7 @@ from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
 
-class Qwen2MoeConfig(PreTrainedConfig):
+class Qwen2MoeConfig(PretrainedConfig):
     r"""
     Configuration class for Qwen2MoE-style models.
 
