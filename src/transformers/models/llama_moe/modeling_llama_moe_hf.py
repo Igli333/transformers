@@ -16,6 +16,7 @@ from transformers.activations import ACT2FN
 from transformers.utils import ModelOutput, logging
 
 from .configuration_llama_moe import LlamaMoEConfig
+from ... import GenerationMixin
 
 logger = logging.get_logger(__name__)
 
@@ -1686,7 +1687,7 @@ class LlamaMoEModel(LlamaMoEPreTrainedModel):
                 mlp.gate.routing_policy = routing_policy
 
 
-class LlamaMoEForCausalLM(LlamaMoEPreTrainedModel):
+class LlamaMoEForCausalLM(LlamaMoEPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
