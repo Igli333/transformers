@@ -1038,7 +1038,7 @@ class MultiPolicyRouter(nn.Module):
             gates = gates / gates.sum(dim=-1, keepdim=True)
             return gates, idx
 
-        elif self.policy == "switch":
+        elif self.policy == "token":
             # Switch Transformer: top-1 but with stability
             B, E = logits.size()
 
