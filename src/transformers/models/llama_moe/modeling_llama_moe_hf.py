@@ -16,7 +16,7 @@ from transformers.activations import ACT2FN
 from transformers.utils import ModelOutput, logging
 
 from .configuration_llama_moe import LlamaMoEConfig
-from ... import GenerationMixin
+from ...generation import GenerationMixin
 
 logger = logging.get_logger(__name__)
 
